@@ -7,9 +7,19 @@
 // How it's built: wasm/README.md
 import { onDestroy, onMount, tick } from "svelte";
 import Aioli from "@biowasm/aioli";
-import { CHANNELS, MODELS, READ_TYPES, exampleRegion, modelByKey, partitionsAround, sameSiteElsewhere } from "./models.js";
+import {
+	CHANNELS,
+	MODELS,
+	truthRecords,
+	READ_TYPES,
+	exampleRegion,
+	modelByKey,
+	partitionsAround,
+	sameSiteElsewhere
+} from "./models.js";
 import { GQ_LOW, LIST_MAX, recordsIn, scanVcf, vcfFile } from "./vcf.js";
 import { guessReference, locateReads } from "./bam.js";
+import { alleleView, referenceSequence, windowAround } from "./alleles.js";
 
 // DeepVariant for the browser (wasm/build.sh or `npm run assets`), served with the app
 const URL_DEEPVARIANT = new URL(`${import.meta.env.BASE_URL}deepvariant/1.10.0`, location.href).href;
@@ -86,8 +96,8 @@ let pileupsForSelected = $state([]);
 let pileupError = $state("");
 let readsInfo = $state(null); // {kind: "realigned" | "phased", window?, changed?, total?, url}
 let linkCopied = $state(false);
-let ranExample = $state.raw(null); // the example of the last run, if it was one
 let tab = $state("calls"); // under the selected call: "calls" (all calls in the region) | "log"
+let baseView = $state(null); // the selected call's alleles, base by base (alleles.js), or {error}
 let pileupIndex = $state(0); // which of the selected call's pileup images is shown
 let openModel = $state("wgs"); // the model open in the examples list
 let editing = $state(true); // your data: the inputs are shown in full (else, after a run, as one line)
@@ -303,7 +313,6 @@ async function runDeepVariant() {
 	}
 	error = "";
 	editing = false;
-	ranExample = source === "example" ? example : null;
 	finished = false;
 	calls = [];
 	selected = null;
@@ -421,11 +430,41 @@ function windowFor(call) {
 	});
 }
 
+// The alleles around a call, base by base: GIAB's truth (examples), DeepVariant's calls (this run) and your
+// VCF's, each as two haplotypes against the reference
+async function showBases(call) {
+	baseView = null;
+	const rec = (c) => ({ pos: c.pos, ref: c.ref, alt: c.alt, gt: c.GT ?? c.gt });
+	const near = (r) => r.chrom === call.chrom && Math.abs(r.pos - call.pos) <= 30;
+	const truth = run.example ? truthRecords(run.example)?.filter(near) : null;
+	const seed = windowAround([rec(call), ...(truth ?? [])]);
+	const overlaps = (r) => r.chrom === call.chrom && r.pos <= seed.end && r.pos + r.ref.length - 1 >= seed.start;
+	// DeepVariant's: what it called around here (PASS), and the selected call whatever its filter
+	const dv = calls.filter((c) => overlaps(c) && (c === call || c.filter === "PASS")).map(rec);
+	const yoursHere = yourRecords?.filter((r) => overlaps(r) && r.filter === "PASS").map(rec);
+	const w = windowAround([...dv, ...(truth ?? []), ...(yoursHere ?? [])]);
+	try {
+		const window = await referenceSequence(run.reference, call.chrom, w.start, w.end);
+		if (selected !== call) return;
+		const sets = [
+			...(truth?.length ? [{ label: "Truth (GIAB v4.2.1)", short: "the truth", records: truth }] : []),
+			{ label: "DeepVariant", short: "DeepVariant", records: dv },
+			...(yoursHere ? [{ label: "Your VCF", short: "your VCF", records: yoursHere }] : [])
+		];
+		const view = alleleView(window, sets);
+		view.sets.forEach((v, i) => (v.short = sets[i].short));
+		baseView = view;
+	} catch (e) {
+		if (selected === call) baseView = { error: e.message ?? String(e) };
+	}
+}
+
 async function select(call) {
 	selected = call;
 	pileupsForSelected = [];
 	pileupIndex = 0;
 	pileupError = "";
+	showBases(call);
 	const halfWidth = run.model.realigns ? PILEUP_HALF_WIDTH : 600; // long reads: a wider view
 	const locus = `${call.chrom}:${call.pos - halfWidth}-${call.pos + halfWidth}`;
 	const realigned = run.model.realigns ? windowFor(call) : null;
@@ -457,18 +496,28 @@ async function select(call) {
 // DeepVariant used: the reads after its local realignment (short reads), the reads with its own phasing,
 // grouped by haplotype (long reads), and the pangenome's haplotypes (pangenome-aware)
 const NAME_REALIGNED = "Realigned by DeepVariant (what it saw)";
+// Compact read tracks, so the whole view fits on a screen: short rows and a thin coverage track (scroll for more)
+const IGV_READS = { height: 150, coverageTrackHeight: 24, alignmentRowHeight: 8, squishedRowHeight: 3 };
 async function showInIgv(locus, realigned) {
 	const realignedTrack = realigned && {
 		name: NAME_REALIGNED,
 		type: "alignment",
 		format: "bam",
+		...IGV_READS,
 		url: realigned.file,
 		indexed: false
 	};
 	if (!igvBrowser) {
 		igvModule ??= (await import("igv")).default;
 		const tracks = [
-			{ name: "This run (DeepVariant 1.10 in your browser)", type: "variant", format: "vcf", url: run.vcfFile, indexed: false },
+			{
+				name: "This run (DeepVariant 1.10 in your browser)",
+				type: "variant",
+				format: "vcf",
+				url: run.vcfFile,
+				indexed: false,
+				height: 30
+			},
 			...(run.yourVcf
 				? [{ name: "Your DeepVariant VCF", type: "variant", format: "vcf", url: run.yourVcf, indexed: false }]
 				: []),
@@ -476,6 +525,7 @@ async function showInIgv(locus, realigned) {
 				name: "Your reads (as aligned, what IGV shows)",
 				type: "alignment",
 				format: "bam",
+				...IGV_READS,
 				url: run.reads.bam,
 				indexURL: run.reads.index
 			},
@@ -486,6 +536,7 @@ async function showInIgv(locus, realigned) {
 							name: "Phased by DeepVariant (pileup rows are sorted by this)",
 							type: "alignment",
 							format: "bam",
+							...IGV_READS,
 							url: run.phased,
 							indexed: false,
 							groupBy: "tag:HP"
@@ -578,7 +629,6 @@ function clearResults() {
 	calls = [];
 	selected = null;
 	finished = false;
-	ranExample = null;
 	yourRecords = null;
 	error = "";
 	steps = { python: steps.python, models: steps.models };
@@ -686,13 +736,6 @@ const KIND_TAGS = {
 	called: "called"
 };
 const kindClass = (kind) => `kind-${kind.split(" ")[0]}`;
-// This run's call at the example's position (an indel may be placed a few bp off)
-const exampleCall = $derived.by(() => {
-	if (!ranExample || !calls.length) return null;
-	const near = (c) => Math.abs(c.pos - ranExample.pos);
-	const closest = calls.toSorted((a, b) => near(a) - near(b))[0];
-	return near(closest) <= 50 ? closest : null;
-});
 // Long alleles, shortened for titles: CCCCCACCCC...AGCT (+35 bp); the full ones are in a tooltip
 const shortAllele = (allele, ref) => {
 	if (allele.length <= 12) return allele;
@@ -704,7 +747,6 @@ const alleles = (c) =>
 		.split(",")
 		.map((a) => shortAllele(a, c.ref))
 		.join(", ")}`;
-const callText = (c) => `${c.GT} ${alleles(c)}, GQ ${c.GQ}${c.filter === "PASS" ? "" : ` (${c.filter})`}`;
 const elsewhere = $derived(source === "example" ? sameSiteElsewhere(model, example) : []);
 // DeepVariant's pileup PNG (show_examples, nucleus vis.draw_deepvariant_pileup) is its channels side by side
 // under a 20 px row of labels, at 1 px per cell: cut it into one image per channel, to show them larger, labelled
@@ -1138,37 +1180,24 @@ const fileName = (r) => (r.url ? r.url.split("/").pop().split("?")[0] : r.alignm
 		{/if}
 
 		<section class="main" aria-label="Selected call">
-			<!-- The example: what's hard about it, and how each call compares -->
+			<!-- The example: what's hard about it -->
 			{#if source === "example"}
 				<div class="card">
 					<div class="head-row">
 						<div>
-							<span class="hint">{model.name} example</span>
+							<span class="hint">{model.name} example · chr20:{fmt(example.pos)}</span>
 							<h1>{example.what.charAt(0).toUpperCase() + example.what.slice(1)}</h1>
-							<span class="mono sub">chr20:{fmt(example.pos)} · runs on {exampleRegion(model, example)}</span>
-							{#if example.note || elsewhere.length}
-								<p class="ex-note">
-									{example.note ?? ""}
-									{#each elsewhere as o (o.model.key)}
-										<button class="link" onclick={() => inspectExample(o.model.key, o.index)}
-											>Same site with {o.model.name} →</button
-										>
-									{/each}
-								</p>
-							{/if}
+							{#if example.note}<p class="ex-note">{example.note}</p>{/if}
+							<p class="hint">
+								Official case-study run: <span class="mono">{example.official}</span>.
+								{#each elsewhere as o (o.model.key)}
+									<button class="link" onclick={() => inspectExample(o.model.key, o.index)}
+										>Same site with {o.model.name} →</button
+									>
+								{/each}
+							</p>
 						</div>
 						<button class="secondary" onclick={copyLink}>{linkCopied ? "Link copied" : "Copy link"}</button>
-					</div>
-					<div class="compare">
-						<div><span class="hint">Truth · GIAB v4.2.1</span><b class="mono">{example.truth}</b></div>
-						<div class="official"><span class="hint">Official case-study run</span><b class="mono">{example.official}</b></div>
-						<div>
-							<span class="hint">This run, in your browser</span>
-							{#if busy || !ready}<b class="muted">{!ready ? "Loading DeepVariant…" : "Running…"}</b>
-							{:else if ranExample === example && exampleCall}<b class="mono">{callText(exampleCall)}</b>
-							{:else if ranExample === example && finished}<b class="muted">No candidate here</b>
-							{:else}<b class="muted">–</b>{/if}
-						</div>
 					</div>
 					{#if busy || !finished}
 						<div class="steps">
@@ -1188,83 +1217,139 @@ const fileName = (r) => (r.url ? r.url.split("/").pop().split("?")[0] : r.alignm
 				{@const probs = genotypeProbabilities(selected)}
 				{@const yours = yourRecords ? yoursFor(selected) : null}
 				<div class="card call-card">
-					<div class="call-main">
+					<div class="call-top">
 						<div>
-							{#if source === "upload"}<span class="hint">{ranModel.name} · {ranRegion}</span>{/if}
+							<span class="hint"
+								>{source === "upload" ? `${ranModel.name} · ${ranRegion}` : "DeepVariant's call, rerun in your browser"}</span
+							>
 							<h2 class="call-title mono">
 								{selected.chrom}:{fmt(selected.pos)}
 								<span class="muted" title="{selected.ref} → {selected.alt}">{alleles(selected)}</span>
 							</h2>
 						</div>
-						<div class="stat-chips">
-							<span><span class="k">genotype</span> <b class="mono">{selected.GT}</b></span>
-							<span
-								><span class="k">GQ</span> <b>{selected.GQ}</b>
-								<span class="hint">{(10 ** (-Number(selected.GQ) / 10) * 100).toPrecision(2)}% chance wrong</span></span
-							>
-							<span><span class="k">filter</span> <b>{selected.filter}</b> <span class="hint">QUAL {selected.qual}</span></span>
-							<span><span class="k">depth</span> <b>{selected.DP}</b> <span class="hint">AD {selected.AD}</span></span>
-							<span><span class="k">called by</span> <b>{modelName(selected.MID)}</b></span>
-						</div>
 						{#if source === "upload"}<button class="secondary" onclick={copyLink}
 								>{linkCopied ? "Link copied" : "Copy link"}</button
 							>{/if}
 					</div>
-					<div class="call-probs">
-						<h3>Genotype probabilities <span class="hint">from PL</span></h3>
-						<div class="probs">
-							{#each probs.filter((x) => x.p >= 0.001 || probs.length <= 3) as { gt, p } (gt)}
-								<div class="prob" title="{gt}: {p.toPrecision(3)}">
-									<span class="gt">{gt}</span>
-									<div class="prob-bar"><div style="width: {Math.max(0.5, p * 100)}%"></div></div>
-									<span class="p">{p >= 0.001 ? `${(p * 100).toFixed(1)}%` : p.toExponential(0)}</span>
+
+					<!-- The alleles, base by base -->
+					{#if baseView?.error}
+						<p class="hint">Couldn't show the bases: {baseView.error}</p>
+					{:else if baseView}
+						<div class="bases">
+							<div class="b-row">
+								<span class="b-label">Reference</span>
+								<span class="b-seq"
+									>{#each baseView.ref as c, i (i)}<span class="b {c.kind}" class:at={c.pos === selected.pos}>{c.ch}</span
+										>{/each}</span
+								>
+							</div>
+							{#each baseView.sets as set (set.label)}
+								<div class="b-set">
+									{#each set.rows as row, k (k)}
+										<div class="b-row">
+											<span class="b-label"
+												>{#if k === 0}<b>{set.label}</b>{:else if set.same === true}<span class="ok"
+														>✓ same as {baseView.sets[0].short}</span
+													>{:else if set.same === false}<span class="bad">✗ differs from {baseView.sets[0].short}</span
+													>{/if}</span
+											>
+											<span class="b-seq"
+												>{#each row as c, i (i)}<span class="b {c.kind}">{c.ch}</span>{/each}</span
+											>
+										</div>
+									{/each}
+									{#each set.unknown as u (u.pos)}
+										<p class="hint b-note">
+											No genotype at {fmt(u.pos)} ({alleles(u)}): DeepVariant saw this candidate but called ./., so it's left out
+											above.
+										</p>
+									{/each}
 								</div>
 							{/each}
+							<p class="hint b-legend">
+								Each pair of rows is one genotype's two haplotypes (in genotype order, not phased):
+								<span class="b ins">A</span> inserted, <span class="b del">–</span> deleted, <span class="b sub">A</span>
+								substituted,
+								<span class="b match">A</span> as the reference.
+							</p>
 						</div>
-						{#if probs.length > 3 && probs.some((x) => x.p < 0.001)}
-							<p class="hint">{probs.filter((x) => x.p < 0.001).length} other genotypes: under 0.1% each.</p>
-						{/if}
-						{#if selected.filter === "NoCall"}<p class="hint">NoCall (./.): no genotype was likely enough to call.</p>{/if}
-						{#if selected.filter === "RefCall"}<p class="hint">RefCall: DeepVariant thinks this candidate is reference.</p>{/if}
-					</div>
-					<div class="call-how">
-						<h3>How it was called</h3>
-						<ul class="how">
-							<li>
-								{#if selected.MID === "small_model"}
-									By the <b>small model</b>, from summary features (allele counts, base and mapping qualities): no pileup image.
-								{:else}
-									By the <b>CNN</b>, from the pileup images below.
+					{:else}
+						<p class="hint">Reading the reference…</p>
+					{/if}
+
+					<div class="call-cols">
+						<dl class="facts-dl">
+							<dt>Genotype</dt>
+							<dd class="mono"><b>{selected.GT}</b></dd>
+							<dt>GQ</dt>
+							<dd>
+								<b>{selected.GQ}</b>
+								<span class="hint">{(10 ** (-Number(selected.GQ) / 10) * 100).toPrecision(2)}% chance it's wrong</span>
+							</dd>
+							<dt>Filter</dt>
+							<dd><b>{selected.filter}</b> <span class="hint">QUAL {selected.qual}</span></dd>
+							<dt>Depth</dt>
+							<dd><b>{selected.DP}</b> <span class="hint">reads per allele: {selected.AD?.split(",").join(" · ")}</span></dd>
+							<dt>Called by</dt>
+							<dd><b>{modelName(selected.MID)}</b></dd>
+						</dl>
+						<div class="call-probs">
+							<h3>Genotype probabilities <span class="hint">from PL</span></h3>
+							<div class="probs">
+								{#each probs.filter((x) => x.p >= 0.001 || probs.length <= 3) as { gt, p } (gt)}
+									<div class="prob" title="{gt}: {p.toPrecision(3)}">
+										<span class="gt">{gt}</span>
+										<div class="prob-bar"><div style="width: {Math.max(0.5, p * 100)}%"></div></div>
+										<span class="p">{p >= 0.001 ? `${(p * 100).toFixed(1)}%` : p.toExponential(0)}</span>
+									</div>
+								{/each}
+							</div>
+							{#if probs.length > 3 && probs.some((x) => x.p < 0.001)}
+								<p class="hint">{probs.filter((x) => x.p < 0.001).length} other genotypes: under 0.1% each.</p>
+							{/if}
+							{#if selected.filter === "NoCall"}<p class="hint">NoCall (./.): no genotype was likely enough to call.</p>{/if}
+							{#if selected.filter === "RefCall"}<p class="hint">RefCall: DeepVariant thinks this candidate is reference.</p>{/if}
+						</div>
+						<div class="call-how">
+							<h3>How it was called</h3>
+							<ul class="how">
+								<li>
+									{#if selected.MID === "small_model"}
+										By the <b>small model</b>, from summary features (allele counts, base and mapping qualities): no pileup image.
+									{:else}
+										By the <b>CNN</b>, from the pileup images below.
+									{/if}
+								</li>
+								{#if readsInfo?.kind === "realigned"}
+									<li>
+										Local realignment changed <b
+											>{readsInfo.changed ? `${readsInfo.changed} of ${readsInfo.total}` : `none of the ${readsInfo.total}`}</b
+										>
+										reads in <span class="mono">{readsInfo.window}</span>.
+										<a href={readsInfo.url} download="realigned_reads.bam">Download them</a>
+									</li>
+								{:else if readsInfo?.kind === "phased"}
+									<li>
+										Not realigned: DeepVariant phases long reads itself and sorts the pileup rows by haplotype.
+										<a href={readsInfo.url} download="phased_by_deepvariant.bam">Download the phased reads</a>
+									</li>
 								{/if}
-							</li>
-							{#if readsInfo?.kind === "realigned"}
-								<li>
-									Local realignment changed <b
-										>{readsInfo.changed ? `${readsInfo.changed} of ${readsInfo.total}` : `none of the ${readsInfo.total}`}</b
-									>
-									reads in <span class="mono">{readsInfo.window}</span>.
-									<a href={readsInfo.url} download="realigned_reads.bam">Download them</a>
-								</li>
-							{:else if readsInfo?.kind === "phased"}
-								<li>
-									Not realigned: DeepVariant phases long reads itself and sorts the pileup rows by haplotype.
-									<a href={readsInfo.url} download="phased_by_deepvariant.bam">Download the phased reads</a>
-								</li>
-							{/if}
-							{#if ranModel.pangenome}
-								<li>
-									Pangenome-aware: the top half of each pileup image is the pangenome's haplotypes, the bottom half the reads.
-								</li>
-							{/if}
-							{#if yourRecords}
-								<li class:ok={yours && agrees(selected)} class:differs={yours && !agrees(selected)}>
-									{#if !yours}Your VCF has no record here.
-									{:else if agrees(selected)}Your VCF agrees: {yours.GT}, {yours.filter}, GQ {yours.GQ}.
-									{:else}Your VCF says {yours.GT}, {yours.filter}, GQ {yours.GQ}: another version, model or flags, or (where more
-										reads cover a site than fit in a pileup image) other sampled reads.{/if}
-								</li>
-							{/if}
-						</ul>
+								{#if ranModel.pangenome}
+									<li>
+										Pangenome-aware: the top half of each pileup image is the pangenome's haplotypes, the bottom half the reads.
+									</li>
+								{/if}
+								{#if yourRecords}
+									<li class:ok={yours && agrees(selected)} class:differs={yours && !agrees(selected)}>
+										{#if !yours}Your VCF has no record here.
+										{:else if agrees(selected)}Your VCF agrees: {yours.GT}, {yours.filter}, GQ {yours.GQ}.
+										{:else}Your VCF says {yours.GT}, {yours.filter}, GQ {yours.GQ}: another version, model or flags, or (where
+											more reads cover a site than fit in a pileup image) other sampled reads.{/if}
+									</li>
+								{/if}
+							</ul>
+						</div>
 					</div>
 				</div>
 			{:else if finished && !calls.length}
@@ -1274,18 +1359,6 @@ const fileName = (r) => (r.url ? r.url.split("/").pop().split("?")[0] : r.alignm
 			{/if}
 
 			{#if calls.length}
-				<!-- The reads, as aligned and as DeepVariant saw them -->
-				<div class="card view-card">
-					<div class="view-head">
-						<h3>{ranModel?.realigns ? "Reads before and after realignment" : "Reads as aligned and as phased"}</h3>
-						<span class="hint"
-							>{#if ranModel?.realigns}Your reads as IGV shows them, then after DeepVariant's local realignment: what it saw.{:else}Your
-								reads as aligned, then grouped by DeepVariant's own phasing (as the pileup rows are).{/if}</span
-						>
-					</div>
-					<div class="igv" bind:this={divIgv}></div>
-				</div>
-
 				<!-- The pileup images the CNN classified, one panel per channel -->
 				<div class="card view-card">
 					<div class="view-head">
@@ -1333,6 +1406,18 @@ const fileName = (r) => (r.url ? r.url.split("/").pop().split("?")[0] : r.alignm
 						{/if}
 						<a class="hint" href={shown.url} download="{shown.name}.png">Download DeepVariant's PNG</a>
 					{/if}
+				</div>
+
+				<!-- The reads, as aligned and as DeepVariant saw them -->
+				<div class="card view-card">
+					<div class="view-head">
+						<h3>{ranModel?.realigns ? "Reads before and after realignment" : "Reads as aligned and as phased"}</h3>
+						<span class="hint"
+							>{#if ranModel?.realigns}Your reads as IGV shows them, then after DeepVariant's local realignment: what it saw.{:else}Your
+								reads as aligned, then grouped by DeepVariant's own phasing (as the pileup rows are).{/if}</span
+						>
+					</div>
+					<div class="igv" bind:this={divIgv}></div>
 				</div>
 			{/if}
 
@@ -2022,34 +2107,6 @@ button.run:disabled {
 	font-size: 16px;
 	margin-top: 2px;
 }
-.compare,
-.stats {
-	display: grid;
-	grid-template-columns: repeat(auto-fit, minmax(170px, 1fr));
-	gap: 1px;
-	background: var(--line);
-	border: 1px solid var(--line);
-	border-radius: 10px;
-	overflow: hidden;
-}
-.compare > div,
-.stats > div {
-	display: flex;
-	flex-direction: column;
-	gap: 2px;
-	padding: 8px 12px;
-	background: var(--bg);
-}
-.compare b {
-	font-size: 13px;
-	line-height: 1.4;
-}
-.compare .official {
-	background: var(--accent-subtle);
-}
-.stats b {
-	font-size: 17px;
-}
 .ex-note {
 	margin-top: 6px;
 	font-size: 13px;
@@ -2110,44 +2167,124 @@ button.run:disabled {
 }
 
 /* The selected call: a compact header, then what DeepVariant looked at */
-/* Side by side when there's room: the call, its genotype probabilities, how it was called */
+/* The selected call: its alleles base by base, then the facts, genotype probabilities and how it was called */
 .call-card {
 	padding: 14px 18px;
 	display: flex;
-	flex-wrap: wrap;
-	gap: 12px 28px;
-}
-.call-main {
-	flex: 1.2 1 300px;
-	display: flex;
 	flex-direction: column;
+	gap: 12px;
+}
+.call-top {
+	display: flex;
 	align-items: flex-start;
-	gap: 8px;
+	justify-content: space-between;
+	gap: 12px;
+}
+.call-cols {
+	display: flex;
+	flex-wrap: wrap;
+	gap: 12px 32px;
+}
+.facts-dl {
+	flex: 1 1 230px;
+	display: grid;
+	grid-template-columns: auto 1fr;
+	gap: 3px 12px;
+	margin: 0;
+	font-size: 13px;
+}
+.facts-dl dt {
+	color: var(--muted);
+}
+.facts-dl dd {
+	margin: 0;
 }
 .call-probs {
-	flex: 0.8 1 220px;
+	flex: 1 1 220px;
 }
 .call-how {
-	flex: 1.2 1 260px;
+	flex: 1.3 1 260px;
 }
-.stat-chips {
-	display: flex;
-	flex-wrap: wrap;
-	gap: 6px;
-}
-.stat-chips > span {
-	display: inline-flex;
-	align-items: baseline;
-	gap: 5px;
-	padding: 4px 10px;
+/* Bases: one column per base (or inserted base), rows lined up */
+.bases {
+	overflow-x: auto;
+	padding: 10px 12px;
 	border: 1px solid var(--line);
 	border-radius: 8px;
 	background: var(--bg-subtle);
-	font-size: 13px;
+}
+.b-row {
+	display: flex;
+	align-items: center;
+	gap: 12px;
 	white-space: nowrap;
 }
-.stat-chips .k {
+.b-label {
+	flex: 0 0 150px;
+	font-size: 12px;
 	color: var(--muted);
+	overflow: hidden;
+	text-overflow: ellipsis;
+}
+.b-label b {
+	color: var(--fg);
+	font-weight: 600;
+}
+.b-set {
+	margin-top: 6px;
+	padding-top: 6px;
+	border-top: 1px dashed var(--line);
+}
+.b-seq {
+	display: inline-flex;
+}
+.b {
+	display: inline-block;
+	width: 1.05em;
+	text-align: center;
+	font:
+		600 14px/1.5 ui-monospace,
+		SFMono-Regular,
+		Menlo,
+		monospace;
+	border-radius: 2px;
+}
+.b.ref {
+	color: var(--fg);
+}
+.b.ref.at {
+	box-shadow: inset 0 -2px 0 var(--accent);
+}
+.b.match {
+	color: var(--muted);
+	font-weight: 400;
+	opacity: 0.55;
+}
+.b.gap {
+	color: var(--muted);
+	font-weight: 400;
+	opacity: 0.35;
+}
+.b.ins {
+	color: var(--tag-ok);
+	background: var(--tag-ok-bg);
+}
+.b.del {
+	color: var(--tag-missed);
+	background: var(--tag-missed-bg);
+}
+.b.sub {
+	color: var(--tag-gt);
+	background: var(--tag-gt-bg);
+}
+.b-note {
+	margin: 4px 0 0 162px;
+}
+.b-legend {
+	margin-top: 8px;
+	white-space: normal;
+}
+.b-legend .b {
 	font-size: 12px;
 }
 .view-card {

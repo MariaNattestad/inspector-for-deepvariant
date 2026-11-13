@@ -78,23 +78,6 @@ export const MODELS = [
 				official: "0/1 TTG>T (GQ 21): the expansion is missed"
 			},
 			{
-				pos: 51726889,
-				what: "a poly-T run, extra false allele",
-				label: "Poly-T run",
-				kind: "extra allele",
-				truth: "CTTTTTTTTTT>C (a 10 bp poly-T deletion), 0/1",
-				official: "1/2 (GQ 29): the deletion plus an extra T that isn't there"
-			},
-			{
-				pos: 31460620,
-				what: "a 6 bp poly-A insertion, called",
-				label: "Poly-A insertion",
-				kind: "called",
-				truth: "C>CAAAAAA, 0/1",
-				official: "0/1 (GQ 16), by the small model",
-				note: "Only 2 of 32 reads support the full 6 bp insertion, and it's right. PacBio and ONT get its length wrong."
-			},
-			{
 				pos: 62491856,
 				what: "two 35 bp insertions, called",
 				label: "Two 35 bp insertions",
@@ -165,25 +148,25 @@ export const MODELS = [
 				kind: "missed",
 				truth: "GA>G, 0/1",
 				official: "no-call (./., GQ 6)",
-				note: "Oxford Nanopore misses it too (see the ONT examples)."
+				note: "Oxford Nanopore misses it too."
 			},
 			{
-				pos: 9156819,
-				what: "a CCTC repeat expansion, called",
-				label: "CCTC repeat",
+				pos: 23896814,
+				what: "a TG repeat with two expansions, called",
+				label: "TG repeat",
 				kind: "called",
-				truth: "G>GCCTC and a longer CCTC expansion, 1/2",
-				official: "2|1 (GQ 58), by the small model",
-				note: "Long reads span the 20 bp expansion that short reads can't; Illumina WGS misses that allele."
+				truth: "T>TTG and T>TTGTG, 1/2",
+				official: "1|2 (GQ 50)",
+				note: "Illumina WGS and pangenome-aware WGS get this one wrong."
 			},
 			{
-				pos: 8643753,
-				what: "a 30 bp insertion in a TC repeat, called",
-				label: "30 bp insertion",
+				pos: 52588194,
+				what: "a 3 bp poly-T insertion, called",
+				label: "Poly-T insertion",
 				kind: "called",
-				truth: "C>C+30 bp, 0/1",
-				official: "1|0 (GQ 26), by the small model",
-				note: "Illumina WGS and pangenome-aware WGS miss it."
+				truth: "C>CTTT, 0/1",
+				official: "0/2 CT>C,CTTTT (GQ 4): the same insertion, written another way",
+				note: "Right but barely confident; Illumina WGS, ONT and hybrid get it wrong."
 			}
 		]
 	},
@@ -212,31 +195,22 @@ export const MODELS = [
 				official: "0/1 (GQ 4)"
 			},
 			{
-				pos: 348853,
-				what: "a missed 1 bp deletion",
-				label: "1 bp deletion",
-				kind: "missed",
-				truth: "GA>G, 0/1",
-				official: "no-call (./., GQ 16)",
-				note: "PacBio misses it too (see the PacBio examples)."
+				pos: 23896814,
+				what: "a TG repeat with two expansions, called",
+				label: "TG repeat",
+				kind: "called",
+				truth: "T>TTG and T>TTGTG, 1/2",
+				official: "1/2 (GQ 52)",
+				note: "Illumina WGS and pangenome-aware WGS get this one wrong."
 			},
 			{
-				pos: 9156819,
-				what: "a CCTC repeat expansion, called",
-				label: "CCTC repeat",
+				pos: 63059122,
+				what: "a 30 bp insertion, called",
+				label: "30 bp insertion",
 				kind: "called",
-				truth: "G>GCCTC and a longer CCTC expansion, 1/2",
-				official: "1|2 (GQ 64), by the small model",
-				note: "Long reads span the 20 bp expansion that short reads can't; Illumina WGS misses that allele."
-			},
-			{
-				pos: 60029408,
-				what: "a 21 bp insertion, called",
-				label: "21 bp insertion",
-				kind: "called",
-				truth: "G>G+21 bp, 0/1",
-				official: "0|1 (GQ 21), by the small model",
-				note: "Illumina WGS and pangenome-aware WGS miss it."
+				truth: "A>A+30 bp, 0/1",
+				official: "0/1 (GQ 12)",
+				note: "Illumina WGS misses it."
 			}
 		]
 	},
@@ -322,6 +296,29 @@ export const MODELS = [
 		]
 	}
 ];
+
+// GIAB v4.2.1's records around each example (from the case studies' hap.py output), for the base-level view:
+// [pos, ref, alts, genotype]. The WES example is outside GIAB's confident regions: no truth.
+const TRUTH = {
+	26263468: [
+		[26263466, "A", "AC", "0/1"],
+		[26263468, "T", "TATC", "0/1"]
+	],
+	35438863: [[35438863, "A", "ATG", "1/1"]],
+	9156819: [[9156819, "G", "GCCTC,GCCTCCCTCCCTCCCTCCCTC", "1/2"]],
+	12442385: [[12442385, "TTG", "T,TTGTGTGTGTGTGTG", "1/2"]],
+	62491856: [[62491856, "C", "CCCCCACCCCAGAGTGCCCCCTCTGCTCTCCCAGCT,CCCCCACCCCAGAGTGCCCTCTCTGCTCTCCCAGCT", "1/2"]],
+	818488: [[818488, "A", "AT,ATT", "1/2"]],
+	348853: [[348853, "GA", "G", "0/1"]],
+	23896814: [[23896814, "T", "TTG,TTGTG", "1/2"]],
+	52588194: [[52588194, "C", "CTTT", "0/1"]],
+	238845: [[238845, "G", "GA", "1/1"]],
+	63059122: [[63059122, "A", "AGCCTCCTCCAGATGGGAGGAGGTAGGAGGT", "0/1"]],
+	4761753: [[4761753, "A", "G", "1/1"]],
+	8643753: [[8643753, "C", "CTCCCTCTCCCTCTCCCTCTCCCTCTCCCTT", "0/1"]]
+};
+export const truthRecords = (example) =>
+	TRUTH[example.pos]?.map(([pos, ref, alt, gt]) => ({ chrom: "chr20", pos, ref, alt, gt })) ?? null;
 
 export const modelByKey = (key) => MODELS.find((m) => m.key === key);
 

@@ -234,17 +234,22 @@ evaluate on; chr20 is held out of training), at sites where the official 1.10 ru
 (the case studies' hap.py output) or makes a low-confidence call, cut from that case study's own BAM
 (`examples.sh`). The page lists each site's truth and official call (`src/models.js`).
 
+All are called by the CNN (none by the small model), so each has pileup images.
+
 - **WGS**: `make_examples --realigner_diagnostics` was run headlessly on ±300 bp around all 359 chr20 errors,
-  and the five with the most reads changed by realignment were kept: missed insertions, wrong genotypes at
-  repeats, and an extra allele in a homopolymer.
-- **Pangenome-aware WGS**: two of those five that the pangenome-aware model gets right, on the same reads.
-- **PacBio**, **ONT**: errors in homopolymers, and a 1 bp deletion both miss (chr20:348,853).
+  and those with the most reads changed by realignment were kept: two missed insertions and two wrong
+  genotypes at repeats.
+- **Pangenome-aware WGS**: the two missed insertions, which the pangenome-aware model gets right, on the same
+  reads.
+- **PacBio**: a homopolymer error and a 1 bp deletion it misses (ONT misses it too). **ONT**: a homopolymer
+  insertion called 0/1.
 - **Hybrid**: a 1/1 SNP called 0/1 though all 63 reads support it. **WES**: a 1/1 deletion with GQ 9 (chr20 has
   only 3 WES errors: two have no reads, one is the 256-read site above).
 - **Called right**: hard sites the model gets right where another model doesn't, from the six hap.py outputs
-  (indels the model calls with the truth's genotype, ranked by how many other models get them wrong): a 6 bp
-  poly-A insertion and a 1/2 pair of 35 bp insertions (WGS), a 1/2 CCTC expansion (PacBio, ONT, hybrid), and
-  30 bp and 21 bp insertions WGS misses (PacBio, hybrid; ONT). All reproduce the official calls headlessly.
+  (CNN calls with the truth's genotype, ranked by how many other models get them wrong): a 1/2 pair of 35 bp
+  insertions (WGS, GQ 5), a TG repeat 1/2 (PacBio, ONT), a poly-T insertion at GQ 4 (PacBio), a 30 bp insertion
+  (ONT), and a CCTC expansion and a 30 bp insertion (hybrid). All reproduce the official calls headlessly.
+- **Truth**: GIAB's records around each site are in `src/models.js` for the page's base-level view.
 
 ```bash
 ./wasm/examples.sh work/pangenome/hprc-v1.1-mc-grch38.gbz.db   # then ./wasm/build.sh copies them to data/
