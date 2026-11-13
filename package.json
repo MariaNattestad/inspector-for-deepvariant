@@ -2,6 +2,7 @@
 	"name": "inspector-for-deepvariant",
 	"version": "0.1.0",
 	"private": true,
+	"license": "MIT",
 	"type": "module",
 	"description": "Rerun DeepVariant in the browser on any locus of your data, and see what it looked at.",
 	"scripts": {

@@ -55,5 +55,5 @@ Gitignored files kept for rebuilding and checking things, none needed to run the
 
 ## License
 
-The app's code doesn't have a license yet. DeepVariant is BSD-3-Clause, © Google LLC
+The app's code: MIT ([LICENSE](LICENSE)). DeepVariant is BSD-3-Clause, © Google LLC
 ([license](https://github.com/google/deepvariant/blob/r1.10/LICENSE)).
