@@ -430,6 +430,16 @@ function windowFor(call) {
 	});
 }
 
+// Scroll the bases so the call's position is in view (on a narrow screen, the window is wider than it)
+function centerOnCall(node) {
+	const center = () => {
+		const at = node.querySelector(".at");
+		if (at) node.scrollLeft = at.offsetLeft - node.clientWidth / 2;
+	};
+	center();
+	return { update: () => tick().then(center) };
+}
+
 // The alleles around a call, base by base: GIAB's truth (examples), DeepVariant's calls (this run) and your
 // VCF's, each as two haplotypes against the reference
 async function showBases(call) {
@@ -675,7 +685,8 @@ onMount(() => {
 
 	worker = new Worker(`${URL_DEEPVARIANT}/worker.mjs`, { type: "module" });
 	worker.onmessage = ({ data: m }) => {
-		if (m.type === "log") logText += m.text + "\n";
+		// (htslib looks for an index next to the realigned reads DeepVariant writes, which need none)
+		if (m.type === "log") logText += m.text.replace(/^\[E::idx_find_and_load\].*\n?/gm, "") + "\n";
 		else if (m.type === "step") steps = { ...steps, [m.step]: m.state };
 		else if (m.type === "ready") {
 			ready = true;
@@ -937,8 +948,8 @@ const fileName = (r) => (r.url ? r.url.split("/").pop().split("?")[0] : r.alignm
 							/>
 							<div class="hint" class:bad={region.error}>
 								{#if region.error}{region.error}
-								{:else if region.pending}Empty: runs where your reads are.
-								{:else if region.auto}Empty: {region.auto}.{:else}Runs on {region.text}.{/if}
+								{:else if region.pending}Leave it empty to run where your reads are.
+								{:else if region.auto}None given, so {region.auto}.{:else}Runs on {region.text}.{/if}
 							</div>
 						</div>
 					</div>
@@ -946,8 +957,8 @@ const fileName = (r) => (r.url ? r.url.split("/").pop().split("?")[0] : r.alignm
 
 				<div class="field-row">
 					<div class="field-label">
-						<h2><span class="step-num optional">4</span> Your VCF <span class="hint">optional</span></h2>
-						<p class="hint">Finds the calls worth a closer look, and compares each with this run</p>
+						<h2><span class="step-num optional">4</span> Your VCF</h2>
+						<p class="hint">Optional. Finds the calls worth a closer look, and compares each with this run</p>
 					</div>
 					<div class="field-body">
 						<input
@@ -997,13 +1008,13 @@ const fileName = (r) => (r.url ? r.url.split("/").pop().split("?")[0] : r.alignm
 								>
 							{/each}
 						</div>
+						{#if busy}<p class="hint">{busy}</p>{/if}
+						{#if error}<p class="bad">Failed: {error.replace(/^Error: /, "")}</p>{/if}
 					</div>
 					<button class="run" onclick={runDeepVariant} disabled={!canRun}
 						>{!ready ? "Loading DeepVariant…" : busy ? "Running…" : "Run DeepVariant"}</button
 					>
 				</div>
-				{#if busy}<p class="hint">{busy}</p>{/if}
-				{#if error}<p class="bad">Failed: {error.replace(/^Error: /, "")}</p>{/if}
 			</section>
 		{:else}
 			<div class="summary-bar">
@@ -1107,9 +1118,9 @@ const fileName = (r) => (r.url ? r.url.split("/").pop().split("?")[0] : r.alignm
 			{@const s = vcfScan.stats}
 			{@const pass = s.filter.PASS ?? 0}
 			<aside class="card side" aria-label="Your calls">
-				<div class="side-head">
+				<div class="side-head stack">
 					<h2>Worth a closer look</h2>
-					<span class="hint">{vcfInput.name}</span>
+					<span class="hint file-name" title={vcfInput.name}>{vcfInput.name}</span>
 				</div>
 				{#if !vcfScan.isDeepVariant}<p class="bad">
 						This VCF has no ##DeepVariant_version line: it may not come from DeepVariant.
@@ -1132,7 +1143,7 @@ const fileName = (r) => (r.url ? r.url.split("/").pop().split("?")[0] : r.alignm
 				<input
 					type="text"
 					class="filter"
-					placeholder="Filter: chr20:12,3"
+					placeholder="Filter by position, e.g. chr20:25,3"
 					aria-label="Filter by position"
 					bind:value={listFilter}
 				/>
@@ -1236,7 +1247,7 @@ const fileName = (r) => (r.url ? r.url.split("/").pop().split("?")[0] : r.alignm
 					{#if baseView?.error}
 						<p class="hint">Couldn't show the bases: {baseView.error}</p>
 					{:else if baseView}
-						<div class="bases">
+						<div class="bases" use:centerOnCall={baseView}>
 							<div class="b-row">
 								<span class="b-label">Reference</span>
 								<span class="b-seq"
@@ -1267,13 +1278,13 @@ const fileName = (r) => (r.url ? r.url.split("/").pop().split("?")[0] : r.alignm
 									{/each}
 								</div>
 							{/each}
-							<p class="hint b-legend">
-								Each pair of rows is one genotype's two haplotypes (in genotype order, not phased):
-								<span class="b ins">A</span> inserted, <span class="b del">–</span> deleted, <span class="b sub">A</span>
-								substituted,
-								<span class="b match">A</span> as the reference.
-							</p>
 						</div>
+						<p class="hint b-legend">
+							Each pair of rows is one genotype's two haplotypes (in genotype order, not phased):
+							<span class="b ins">A</span> inserted, <span class="b del">–</span> deleted, <span class="b sub">A</span>
+							substituted,
+							<span class="b match">A</span> as the reference.
+						</p>
 					{:else}
 						<p class="hint">Reading the reference…</p>
 					{/if}
@@ -1422,67 +1433,70 @@ const fileName = (r) => (r.url ? r.url.split("/").pop().split("?")[0] : r.alignm
 			{/if}
 
 			<!-- Every call in the region, and the log -->
-			<div class="card tabs-card">
-				<div class="tabs" role="tablist">
-					{#if calls.length}
-						<button role="tab" class:on={tab === "calls"} aria-selected={tab === "calls"} onclick={() => (tab = "calls")}
-							>All calls in this region <span class="count">{calls.length}</span></button
+			{#if calls.length || busy || error || finished}
+				<div class="card tabs-card">
+					<div class="tabs" role="tablist">
+						{#if calls.length}
+							<button role="tab" class:on={tab === "calls"} aria-selected={tab === "calls"} onclick={() => (tab = "calls")}
+								>All calls in this region <span class="count">{calls.length}</span></button
+							>
+						{/if}
+						<button
+							role="tab"
+							class:on={tab === "log" || !calls.length}
+							aria-selected={tab === "log" || !calls.length}
+							onclick={() => (tab = "log")}>Log</button
 						>
-					{/if}
-					<button
-						role="tab"
-						class:on={tab === "log" || !calls.length}
-						aria-selected={tab === "log" || !calls.length}
-						onclick={() => (tab = "log")}>Log</button
-					>
-				</div>
-
-				{#if calls.length}
-					<div class="panel" hidden={tab !== "calls"}>
-						<p class="hint">Every call in {ranRegion} ({ranModel.modelType} model). Click one to inspect it.</p>
-						<div class="tablewrap">
-							<table>
-								<thead>
-									<tr
-										><th>position</th><th>ref</th><th>alt</th><th>genotype</th><th class="num">GQ</th><th class="num">QUAL</th><th
-											>filter</th
-										><th class="num">depth</th><th>allele depths</th><th>called by</th>{#if yourRecords}<th>your VCF</th>{/if}</tr
-									>
-								</thead>
-								<tbody>
-									{#each calls as call (`${call.pos}:${call.alt}`)}
-										{@const yours = yourRecords ? yoursFor(call) : null}
-										<tr
-											class:active={call === selected}
-											class:filtered={call.filter !== "PASS"}
-											tabindex="0"
-											onclick={() => select(call)}
-											onkeydown={(e) => e.key === "Enter" && select(call)}
-										>
-											<td>{call.chrom}:{fmt(call.pos)}</td><td class="allele" title={call.ref}>{call.ref}</td><td
-												class="allele"
-												title={call.alt}>{call.alt}</td
-											><td>{call.GT}</td><td class="num">{call.GQ}</td><td class="num">{call.qual}</td><td>{call.filter}</td><td
-												class="num">{call.DP}</td
-											><td>{call.AD}</td><td>{modelName(call.MID)}</td>
-											{#if yourRecords}
-												<td class:differs={yours && !agrees(call)}
-													>{#if !yours}<span class="hint">not in your VCF</span>{:else}{yours.GT}
-														{yours.filter} GQ {yours.GQ}{/if}</td
-												>
-											{/if}
-										</tr>
-									{/each}
-								</tbody>
-							</table>
-						</div>
 					</div>
-				{/if}
 
-				<div class="panel" hidden={calls.length && tab !== "log"}>
-					<pre>{logText || "Nothing yet."}</pre>
+					{#if calls.length}
+						<div class="panel" hidden={tab !== "calls"}>
+							<p class="hint">Every call in {ranRegion} ({ranModel.modelType} model). Click one to inspect it.</p>
+							<div class="tablewrap">
+								<table>
+									<thead>
+										<tr
+											><th>position</th><th>ref</th><th>alt</th><th>genotype</th><th class="num">GQ</th><th class="num">QUAL</th
+											><th>filter</th><th class="num">depth</th><th>allele depths</th><th>called by</th>{#if yourRecords}<th
+													>your VCF</th
+												>{/if}</tr
+										>
+									</thead>
+									<tbody>
+										{#each calls as call (`${call.pos}:${call.alt}`)}
+											{@const yours = yourRecords ? yoursFor(call) : null}
+											<tr
+												class:active={call === selected}
+												class:filtered={call.filter !== "PASS"}
+												tabindex="0"
+												onclick={() => select(call)}
+												onkeydown={(e) => e.key === "Enter" && select(call)}
+											>
+												<td>{call.chrom}:{fmt(call.pos)}</td><td class="allele" title={call.ref}>{call.ref}</td><td
+													class="allele"
+													title={call.alt}>{call.alt}</td
+												><td>{call.GT}</td><td class="num">{call.GQ}</td><td class="num">{call.qual}</td><td>{call.filter}</td><td
+													class="num">{call.DP}</td
+												><td>{call.AD}</td><td>{modelName(call.MID)}</td>
+												{#if yourRecords}
+													<td class:differs={yours && !agrees(call)}
+														>{#if !yours}<span class="hint">not in your VCF</span>{:else}{yours.GT}
+															{yours.filter} GQ {yours.GQ}{/if}</td
+													>
+												{/if}
+											</tr>
+										{/each}
+									</tbody>
+								</table>
+							</div>
+						</div>
+					{/if}
+
+					<div class="panel" hidden={calls.length && tab !== "log"}>
+						<pre>{logText || "Nothing yet."}</pre>
+					</div>
 				</div>
-			</div>
+			{/if}
 		</section>
 	</div>
 </div>
@@ -1574,8 +1588,7 @@ button:focus-visible {
 
 /* Your data: the inputs */
 .setup {
-	max-width: 920px;
-	margin: 0 auto 24px;
+	margin: 0 0 20px;
 	padding: 24px 28px;
 }
 .back {
@@ -1640,6 +1653,9 @@ button:focus-visible {
 	align-items: center;
 	gap: 6px;
 }
+.try-urls > .hint {
+	flex: 1 0 100%;
+}
 .sublabel {
 	display: block;
 	font-size: 13px;
@@ -1648,7 +1664,7 @@ button:focus-visible {
 }
 .models {
 	display: grid;
-	grid-template-columns: repeat(auto-fill, minmax(165px, 1fr));
+	grid-template-columns: repeat(auto-fill, minmax(155px, 1fr));
 	gap: 8px;
 }
 .model {
@@ -1715,6 +1731,22 @@ select {
 input[type="file"] {
 	font-size: 12px;
 	max-width: 100%;
+	color: var(--muted);
+}
+input[type="file"]::file-selector-button {
+	margin-right: 10px;
+	padding: 6px 12px;
+	border: 1px solid var(--line);
+	border-radius: 8px;
+	background: var(--bg);
+	color: var(--fg);
+	font:
+		500 13px system-ui,
+		sans-serif;
+	cursor: pointer;
+}
+input[type="file"]::file-selector-button:hover {
+	background: var(--bg-subtle);
 }
 .run-row {
 	display: flex;
@@ -1986,7 +2018,19 @@ button.run:disabled {
 	color: var(--bg);
 }
 .chip .count {
+	margin-left: 4px;
 	opacity: 0.7;
+	font-variant-numeric: tabular-nums;
+}
+.side-head.stack {
+	flex-direction: column;
+	align-items: stretch;
+	gap: 2px;
+}
+.file-name {
+	overflow: hidden;
+	text-overflow: ellipsis;
+	white-space: nowrap;
 }
 .side > .hint,
 .side > .bad {
@@ -2220,7 +2264,13 @@ button.run:disabled {
 	white-space: nowrap;
 }
 .b-label {
-	flex: 0 0 150px;
+	position: sticky;
+	left: -12px;
+	z-index: 1;
+	margin-left: -12px;
+	padding-left: 12px;
+	background: var(--bg-subtle);
+	flex: 0 0 162px;
 	font-size: 12px;
 	color: var(--muted);
 	overflow: hidden;
@@ -2280,9 +2330,22 @@ button.run:disabled {
 .b-note {
 	margin: 4px 0 0 162px;
 }
+@media (max-width: 600px) {
+	.b-row {
+		flex-direction: column;
+		align-items: flex-start;
+		gap: 0;
+	}
+	.b-label {
+		flex: none;
+		padding-right: 8px;
+	}
+	.b-note {
+		margin-left: 0;
+	}
+}
 .b-legend {
-	margin-top: 8px;
-	white-space: normal;
+	margin-top: -4px;
 }
 .b-legend .b {
 	font-size: 12px;
