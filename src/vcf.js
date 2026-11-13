@@ -88,7 +88,9 @@ const alleles = (gt) => (gt ?? "").split(/[/|]/);
 // {sample, header, compressed, blocks, chroms, records, stats, lists, gvcf}, where blocks is the index used by
 // recordsIn and lists hold up to LIST_MAX calls each: lowGq (PASS with GQ < 20), noCall (./.), hetAlt (1/2).
 export async function scanVcf(file, onProgress) {
-	const compressed = /\.gz$|\.bgz$/i.test(file.name);
+	// By content, not name: gzip files start with 1f 8b
+	const magic = new Uint8Array(await file.slice(0, 2).arrayBuffer());
+	const compressed = magic[0] === 0x1f && magic[1] === 0x8b;
 	const blocks = compressed
 		? await bgzfBlocks(file, onProgress)
 		: Array.from({ length: Math.ceil(file.size / TEXT_BLOCK) }, (_, i) => ({ offset: i * TEXT_BLOCK, size: TEXT_BLOCK }));
