@@ -66,7 +66,10 @@ async function readHeader(bam) {
 			const contigs = [];
 			for (let i = 0; i < nRef; i++) {
 				const nameLength = view.getInt32(p, true);
-				contigs.push({ name: decoder.decode(data.subarray(p + 4, p + 4 + nameLength - 1)), length: view.getInt32(p + 4 + nameLength, true) });
+				contigs.push({
+					name: decoder.decode(data.subarray(p + 4, p + 4 + nameLength - 1)),
+					length: view.getInt32(p + 4 + nameLength, true)
+				});
 				p += 8 + nameLength;
 			}
 			return contigs;
@@ -134,7 +137,12 @@ export async function locateReads(bam, index) {
 	const view = new DataView(data.buffer);
 	const ref = view.getInt32(uoffset + 4, true),
 		pos = view.getInt32(uoffset + 8, true) + 1;
-	return { contigs, chrom: contigs[ref]?.name ?? contigs[r].name, start: pos, end: Math.min(Math.max(end, pos), contigs[r].length) };
+	return {
+		contigs,
+		chrom: contigs[ref]?.name ?? contigs[r].name,
+		start: pos,
+		end: Math.min(Math.max(end, pos), contigs[r].length)
+	};
 }
 
 // The reference a BAM was aligned to, from its contig lengths (chr1 or 1)

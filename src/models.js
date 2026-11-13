@@ -26,9 +26,14 @@ export const CHANNELS = {
 // BAM. How they were picked and made: wasm/deepvariant/README.md ("Examples").
 const WGS_EXAMPLES_BAM = "data/HG003.chr20.inspect_examples.bam";
 
+// Each example also has a short label and its kind (missed, wrong genotype, extra allele, low confidence,
+// or called: a site another model misses), for the list of examples.
 export const MODELS = [
 	{
 		key: "wgs",
+		short: "WGS", // on the examples list's tiles
+		reads: "short", // "short" | "long" | "both"
+		about: "Realigns reads around each candidate. A small model calls the easy candidates, the CNN the rest.",
 		modelType: "WGS",
 		name: "Illumina WGS",
 		caseStudy: `${DOCS}/deepvariant-case-study.md`,
@@ -41,6 +46,8 @@ export const MODELS = [
 			{
 				pos: 26263468,
 				what: "a missed 3 bp insertion",
+				label: "3 bp insertion",
+				kind: "missed",
 				truth: "T>TATC, 0/1",
 				official: "no-call (./., GQ 7)",
 				note: "Realignment gives the insertion to reads that, as aligned, show it as mismatches. Pangenome-aware DeepVariant calls it."
@@ -48,6 +55,8 @@ export const MODELS = [
 			{
 				pos: 35438863,
 				what: "a missed 2 bp insertion",
+				label: "2 bp insertion",
+				kind: "missed",
 				truth: "A>ATG, 1/1",
 				official: "no-call (./., GQ 6)",
 				note: "Pangenome-aware DeepVariant calls it."
@@ -55,18 +64,24 @@ export const MODELS = [
 			{
 				pos: 9156819,
 				what: "a CCTC repeat, wrong genotype",
+				label: "CCTC repeat",
+				kind: "wrong genotype",
 				truth: "G>GCCTC and a longer CCTC expansion, 1/2",
 				official: "0/1 G>GCCTC (GQ 7): the longer allele is missed"
 			},
 			{
 				pos: 12442385,
 				what: "a TG repeat, wrong genotype",
+				label: "TG repeat",
+				kind: "wrong genotype",
 				truth: "TTG>T and a TG expansion, 1/2",
 				official: "0/1 TTG>T (GQ 21): the expansion is missed"
 			},
 			{
 				pos: 51726889,
 				what: "a poly-T run, extra false allele",
+				label: "Poly-T run",
+				kind: "extra allele",
 				truth: "CTTTTTTTTTT>C (a 10 bp poly-T deletion), 0/1",
 				official: "1/2 (GQ 29): the deletion plus an extra T that isn't there"
 			}
@@ -74,6 +89,9 @@ export const MODELS = [
 	},
 	{
 		key: "wes",
+		short: "WES", // on the examples list's tiles
+		reads: "short", // "short" | "long" | "both"
+		about: "Short reads in capture regions. Realigns reads around each candidate; the CNN calls every one.",
 		modelType: "WES",
 		name: "Illumina WES (exome)",
 		caseStudy: `${DOCS}/deepvariant-exome-case-study.md`,
@@ -89,6 +107,8 @@ export const MODELS = [
 				pos: 62065249,
 				region: "chr20:62064451-62065810", // the IDT capture interval around it (idt_capture_novogene.grch38.bed)
 				what: "a low-confidence 6 bp deletion",
+				label: "6 bp deletion",
+				kind: "low confidence",
 				truth: "outside GIAB's confident regions",
 				official: "1/1 TGCCAGG>T (GQ 9)",
 				note: "All 29 reads support the deletion, yet GQ is 9."
@@ -97,6 +117,10 @@ export const MODELS = [
 	},
 	{
 		key: "pacbio",
+		short: "HiFi", // on the examples list's tiles
+		reads: "long", // "short" | "long" | "both"
+		about:
+			"Long reads aren't realigned: DeepVariant phases them itself and sorts pileup rows by haplotype. A small model calls the easy candidates.",
 		modelType: "PACBIO",
 		name: "PacBio HiFi",
 		caseStudy: `${DOCS}/deepvariant-pacbio-model-case-study.md`,
@@ -110,6 +134,8 @@ export const MODELS = [
 			{
 				pos: 818488,
 				what: "a homopolymer, wrong genotype",
+				label: "Homopolymer",
+				kind: "wrong genotype",
 				truth: "A>AT and A>ATT, 1/2",
 				official: "1/1 A>AT (GQ 13): the ATT allele is missed",
 				note: "Only 7 reads cover it."
@@ -117,6 +143,8 @@ export const MODELS = [
 			{
 				pos: 348853,
 				what: "a missed 1 bp deletion",
+				label: "1 bp deletion",
+				kind: "missed",
 				truth: "GA>G, 0/1",
 				official: "no-call (./., GQ 6)",
 				note: "Oxford Nanopore misses it too (see the ONT examples)."
@@ -125,6 +153,10 @@ export const MODELS = [
 	},
 	{
 		key: "ont_r104",
+		short: "ONT", // on the examples list's tiles
+		reads: "long", // "short" | "long" | "both"
+		about:
+			"Phased like PacBio, with a read-support channel that tolerates nearby indel errors. A small model calls the easy candidates.",
 		modelType: "ONT_R104",
 		name: "Oxford Nanopore R10.4.1",
 		caseStudy: `${DOCS}/deepvariant-ont-r104-simplex-case-study.md`,
@@ -138,12 +170,16 @@ export const MODELS = [
 			{
 				pos: 238845,
 				what: "a homopolymer insertion, wrong genotype",
+				label: "Homopolymer insertion",
+				kind: "wrong genotype",
 				truth: "G>GA, 1/1",
 				official: "0/1 (GQ 4)"
 			},
 			{
 				pos: 348853,
 				what: "a missed 1 bp deletion",
+				label: "1 bp deletion",
+				kind: "missed",
 				truth: "GA>G, 0/1",
 				official: "no-call (./., GQ 16)",
 				note: "PacBio misses it too (see the PacBio examples)."
@@ -152,6 +188,10 @@ export const MODELS = [
 	},
 	{
 		key: "hybrid_pacbio_illumina",
+		short: "Hybrid", // on the examples list's tiles
+		reads: "both", // "short" | "long" | "both"
+		about:
+			"PacBio HiFi and Illumina reads of one sample in the same pileup. Realigns reads around each candidate; the CNN calls every one.",
 		modelType: "HYBRID_PACBIO_ILLUMINA",
 		name: "Hybrid PacBio HiFi + Illumina",
 		caseStudy: `${DOCS}/deepvariant-hybrid-case-study.md`,
@@ -164,6 +204,8 @@ export const MODELS = [
 			{
 				pos: 4761753,
 				what: "a homozygous SNP called heterozygous",
+				label: "Homozygous SNP",
+				kind: "wrong genotype",
 				truth: "A>G, 1/1",
 				official: "0/1 (GQ 4)",
 				note: "All 63 reads support G. Next to it, DeepVariant also calls a false 2 bp insertion."
@@ -172,6 +214,9 @@ export const MODELS = [
 	},
 	{
 		key: "wgs_pangenome",
+		short: "Pangenome", // on the examples list's tiles
+		reads: "short", // "short" | "long" | "both"
+		about: "The WGS reads plus pangenome haplotypes (HPRC) as extra rows in each pileup image. The CNN calls every candidate.",
 		modelType: "WGS, pangenome-aware",
 		name: "Pangenome-aware WGS",
 		caseStudy: `${DOCS}/pangenome-aware-wgs-bwa-case-study.md`,
@@ -187,6 +232,8 @@ export const MODELS = [
 			{
 				pos: 26263468,
 				what: "the insertion WGS misses, called",
+				label: "3 bp insertion",
+				kind: "called",
 				truth: "T>TATC, 0/1",
 				official: "0/1 (GQ 18), as T>C next to a T>TTTAC insertion; the WGS model's no-call",
 				note: "Same reads as the first Illumina WGS example."
@@ -194,6 +241,8 @@ export const MODELS = [
 			{
 				pos: 35438863,
 				what: "the 2 bp insertion WGS misses, called",
+				label: "2 bp insertion",
+				kind: "called",
 				truth: "A>ATG, 1/1",
 				official: "1/1 (GQ 13); the WGS model's no-call",
 				note: "Same reads as the second Illumina WGS example."
@@ -220,4 +269,18 @@ export function exampleRegion(model, example) {
 	if (example.region) return example.region;
 	const { start, end } = partitionsAround(example.pos, example.pos, model.partitionSize);
 	return `chr20:${start}-${end}`;
+}
+
+// Read types, in the order the examples list shows them
+export const READ_TYPES = [
+	{ key: "short", name: "Short reads" },
+	{ key: "long", name: "Long reads" },
+	{ key: "both", name: "Short + long reads" }
+];
+
+// The same site as an example in other models (e.g. WGS's missed insertion, called by pangenome-aware WGS)
+export function sameSiteElsewhere(model, example) {
+	return MODELS.filter((m) => m !== model).flatMap((m) =>
+		m.examples.map((ex, i) => ({ model: m, index: i, ex })).filter(({ ex }) => ex.pos === example.pos)
+	);
 }

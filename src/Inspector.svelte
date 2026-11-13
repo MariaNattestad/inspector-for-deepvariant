@@ -7,7 +7,7 @@
 // How it's built: wasm/README.md
 import { onDestroy, onMount, tick } from "svelte";
 import Aioli from "@biowasm/aioli";
-import { CHANNELS, MODELS, exampleRegion, modelByKey, partitionsAround } from "./models.js";
+import { CHANNELS, MODELS, READ_TYPES, exampleRegion, modelByKey, partitionsAround, sameSiteElsewhere } from "./models.js";
 import { GQ_LOW, LIST_MAX, recordsIn, scanVcf, vcfFile } from "./vcf.js";
 import { guessReference, locateReads } from "./bam.js";
 
@@ -26,7 +26,9 @@ const MAX_REGION = 200000; // bp: larger regions would take minutes in the brows
 
 // Inputs
 let modelKey = $state("wgs");
-let source = $state("example"); // "example" | "upload"
+// "example" | "upload": the examples (the home page), or your own data. App's "Inspect your own data" button
+// switches with pickSource, below.
+let { source = $bindable("example") } = $props();
 let exampleIndex = $state(0);
 let readsFrom = $state("file"); // "file" | "url"
 let files = $state([]); // the reads, from your computer
@@ -65,6 +67,11 @@ let pileupsForSelected = $state([]);
 let pileupError = $state("");
 let readsInfo = $state(null); // {kind: "realigned" | "phased", window?, changed?, total?, url}
 let linkCopied = $state(false);
+let ranExample = $state.raw(null); // the example of the last run, if it was one
+let tab = $state("reads"); // the selected call's tab: "reads" | "pileups" | "calls" | "log"
+let openModel = $state("wgs"); // the model open in the examples list
+let editing = $state(true); // your data: the inputs are shown in full (else, after a run, as one line)
+let queued = false; // an example picked while another runs: run it next
 // {model, reference, reads: {bam, index}, pangenome?, example?, position, realigned: [...], phased?: File,
 //  vcfFile, yourVcf?: File, pileups: Promise}
 let run = null;
@@ -260,14 +267,23 @@ function inspectRecord(r) {
 	regionText = `${r.chrom}:${r.pos.toLocaleString("en-US")}`;
 	if (source === "example") source = "upload";
 	if (canRun) runDeepVariant();
-	else document.getElementById("dvi-setup")?.scrollIntoView({ behavior: "smooth" });
+	else {
+		editing = true;
+		tick().then(() => document.getElementById("dvi-setup")?.scrollIntoView({ behavior: "smooth" }));
+	}
 }
 
 // ---------------------------------------------------------------------------------------------------------
 // Running DeepVariant
 // ---------------------------------------------------------------------------------------------------------
 async function runDeepVariant() {
+	if (busy) {
+		queued = true;
+		return;
+	}
 	error = "";
+	editing = false;
+	ranExample = source === "example" ? example : null;
 	finished = false;
 	calls = [];
 	selected = null;
@@ -320,6 +336,13 @@ async function runDeepVariant() {
 }
 
 function onDone({ vcfLines, vcfText, realignedReads, phasedReads }) {
+	// Another example was picked meanwhile: run that instead
+	if (queued) {
+		queued = false;
+		busy = "";
+		runDeepVariant();
+		return;
+	}
 	const header = vcfLines[0].replace(/^#/, "").split("\t");
 	const col = (name) => header.indexOf(name);
 	calls = vcfLines.slice(1).map((line) => {
@@ -522,11 +545,38 @@ function pickExample(i) {
 	exampleIndex = i;
 	regionText = exampleRegion(model, model.examples[i]);
 }
-function pickSource(value) {
+// From the examples list: an example of any model, run right away (or once DeepVariant has loaded)
+function inspectExample(key, i) {
+	modelKey = key;
+	openModel = key;
+	pickExample(i);
+	updateUrl();
+	if (ready) runDeepVariant();
+}
+function clearResults() {
+	calls = [];
+	selected = null;
+	finished = false;
+	ranExample = null;
+	yourRecords = null;
+	error = "";
+	steps = { python: steps.python, models: steps.models };
+	if (igvBrowser) igvModule.removeBrowser(igvBrowser);
+	igvBrowser = null;
+}
+export function pickSource(value) {
 	// The example's position isn't yours: leave it empty, to use where your reads are
 	if (value === "upload" && regionText === exampleRegion(model, example)) regionText = "";
+	// The other mode's results don't carry over
+	if (value !== source) clearResults();
 	source = value;
-	if (value === "example") pickExample(exampleIndex);
+	editing = true;
+	if (value === "example") {
+		pickExample(exampleIndex);
+		if (ready && !finished) runDeepVariant();
+	}
+	updateUrl();
+	window.scrollTo({ top: 0 });
 }
 
 onMount(() => {
@@ -542,13 +592,16 @@ onMount(() => {
 		}
 		if (REFERENCES[params.get("reference")]) referenceKey = params.get("reference");
 	} else pickExample(Math.max(0, Math.min(model.examples.length - 1, Number(params.get("example") ?? 1) - 1)));
+	openModel = modelKey;
 
 	worker = new Worker(`${URL_DEEPVARIANT}/worker.mjs`, { type: "module" });
 	worker.onmessage = ({ data: m }) => {
 		if (m.type === "log") logText += m.text + "\n";
 		else if (m.type === "step") steps = { ...steps, [m.step]: m.state };
-		else if (m.type === "ready") ready = true;
-		else if (m.type === "done") onDone(m);
+		else if (m.type === "ready") {
+			ready = true;
+			if (source === "example") runDeepVariant(); // the home page shows an example, run as soon as it can be
+		} else if (m.type === "done") onDone(m);
 		else if (m.type === "pileups") {
 			run.pileupsPending.resolve(
 				m.images.map(({ name, bytes }) => ({
@@ -560,6 +613,10 @@ onMount(() => {
 			if (run?.pileupsPending && calls.length) run.pileupsPending.reject(new Error(m.text));
 			else error = m.text;
 			busy = "";
+			if (queued) {
+				queued = false;
+				runDeepVariant();
+			}
 		}
 	};
 });
@@ -580,76 +637,95 @@ const STEP_NAMES = {
 const modelName = (mid) => ({ small_model: "small model", deepvariant: "CNN" })[mid] ?? mid ?? "";
 const fmt = (n) => n.toLocaleString("en-US");
 const pct = (a, b) => (b ? `${((100 * a) / b).toFixed(1)}%` : "–");
+
+// The examples list: the models as tiles, short reads first, and what each does, in a few words
+const TILE_ORDER = READ_TYPES.flatMap((rt) => MODELS.filter((m) => m.reads === rt.key));
+const facts = (m) => [
+	m.realigns ? "Realigns reads" : "Phases reads",
+	m.smallModel ? "Small model + CNN" : "CNN only",
+	m.captureRegions ? "Capture intervals" : `${m.partitionSize / 1000} kb partitions`,
+	`${m.channels.length} channels`,
+	...(m.pangenome ? ["+ HPRC haplotypes"] : [])
+];
+const KIND_TAGS = {
+	missed: "missed",
+	"wrong genotype": "wrong GT",
+	"extra allele": "extra allele",
+	"low confidence": "low GQ",
+	called: "called"
+};
+const kindClass = (kind) => `kind-${kind.split(" ")[0]}`;
+// This run's call at the example's position (an indel may be placed a few bp off)
+const exampleCall = $derived.by(() => {
+	if (!ranExample || !calls.length) return null;
+	const near = (c) => Math.abs(c.pos - ranExample.pos);
+	const closest = calls.toSorted((a, b) => near(a) - near(b))[0];
+	return near(closest) <= 50 ? closest : null;
+});
+const callText = (c) => `${c.GT} ${c.ref}>${c.alt}, GQ ${c.GQ}${c.filter === "PASS" ? "" : ` (${c.filter})`}`;
+const elsewhere = $derived(source === "example" ? sameSiteElsewhere(model, example) : []);
+const showTab = (name) => {
+	tab = name;
+	if (name === "reads") tick().then(() => igvBrowser?.visibilityChange?.());
+};
+const fileName = (r) => (r.url ? r.url.split("/").pop().split("?")[0] : r.alignments?.name);
 </script>
 
 <div class="dvi">
-	<h1>Inspect a DeepVariant call</h1>
-	<p class="sub">
-		Why did DeepVariant call a variant this way, when IGV shows something else? Pick the model you ran, give it your reads and a
-		position, and DeepVariant 1.10.0 runs again on that locus, in this tab. For each call you see what it actually looked at: the
-		reads after its <a
-			href="https://github.com/google/deepvariant/blob/r1.10/docs/FAQ.md#what-is-the-realigner-and-how-does-it-work"
-			>local realignment</a
-		> (short reads) or with its own phasing (long reads), the pangenome haplotypes (pangenome-aware), the pileup images its CNN classified
-		and the genotype probabilities. Add your DeepVariant VCF to find the calls worth a closer look and compare each call with yours.
-		Your files stay on your computer.
-	</p>
+	<!-- Your own data: the inputs, in full until a run, then as one line -->
+	{#if source === "upload"}
+		{#if editing || !finished}
+			<section class="card setup" id="dvi-setup">
+				<button class="back" onclick={() => pickSource("example")}>← Back to the examples</button>
+				<h1>Inspect your own data</h1>
+				<p class="lead">
+					Rerun DeepVariant on one locus of your reads, with the model you used. Only the reads are required. Your files stay on
+					your computer: only the locus is read from disk.
+				</p>
 
-	<!-- 1. Model, 2. data, 3. position -->
-	<section class="card-dvi" id="dvi-setup">
-		<h2><span class="step-num">1</span> Model: what <code>--model_type</code> did you run?</h2>
-		<div class="models" role="radiogroup" aria-label="Model">
-			{#each MODELS as m (m.key)}
-				<button
-					class="model"
-					class:active={m.key === modelKey}
-					role="radio"
-					aria-checked={m.key === modelKey}
-					onclick={() => pickModel(m.key)}
-				>
-					<span class="model-name">{m.name}</span>
-					<span class="model-type">{m.modelType}</span>
-				</button>
-			{/each}
-		</div>
-		<p class="hint model-notes">
-			{#if model.realigns}Realigns reads locally before making pileup images.{:else}Doesn't realign reads: phases them instead,
-				and sorts pileup rows by haplotype.{/if}
-			{model.smallModel
-				? "Easy candidates are called by the small model, without a pileup image."
-				: "Every candidate goes to the CNN."}
-			{#if model.pangenome}Also needs the pangenome's haplotypes, as a BAM.{/if}
-			<a href={model.caseStudy}>Case study</a>
-		</p>
-
-		<h2 class="mt"><span class="step-num">2</span> Data</h2>
-		<div class="inputs">
-			<div>
-				<label
-					><input type="radio" name="dvi-source" checked={source === "example"} onchange={() => pickSource("example")} /> Example:
-					a hard call in HG003 (chr20)</label
-				>
-				{#if source === "example"}
-					<select class="indent" aria-label="Example" value={exampleIndex} onchange={(e) => pickExample(Number(e.target.value))}>
-						{#each examples as ex, i (ex.pos)}
-							<option value={i}>chr20:{fmt(ex.pos)}: {ex.what}</option>
-						{/each}
-					</select>
-					<div class="hint indent">
-						Truth (GIAB): {example.truth}. DeepVariant 1.10's official run: {example.official}.
-						{#if example.note}{example.note}{/if}
+				<div class="field-row">
+					<div class="field-label">
+						<h2><span class="num">1</span> Model</h2>
+						<p class="hint">The <code>--model_type</code> you ran</p>
 					</div>
-				{/if}
-				<label
-					><input type="radio" name="dvi-source" checked={source === "upload"} onchange={() => pickSource("upload")} /> Your data</label
-				>
-				{#if source === "upload"}
-					<div class="indent uploads">
-						<p class="hint only-reads">Only the reads are needed. Everything else, position included, is optional.</p>
-						<span class="field">Reads</span>
-						<div class="choice">
-							<label><input type="radio" name="dvi-reads-from" value="file" bind:group={readsFrom} /> From your computer</label>
-							<label><input type="radio" name="dvi-reads-from" value="url" bind:group={readsFrom} /> From a URL</label>
+					<div class="field-body">
+						<div class="models" role="radiogroup" aria-label="Model">
+							{#each MODELS as m (m.key)}
+								<button
+									class="model"
+									class:active={m.key === modelKey}
+									role="radio"
+									aria-checked={m.key === modelKey}
+									onclick={() => pickModel(m.key)}
+								>
+									<span class="model-name">{m.name}</span>
+									<span class="model-type">{m.modelType}</span>
+								</button>
+							{/each}
+						</div>
+						<p class="hint">{model.about} <a href={model.caseStudy}>Case study</a></p>
+					</div>
+				</div>
+
+				<div class="field-row">
+					<div class="field-label">
+						<h2><span class="num">2</span> Reads</h2>
+						<p class="hint">A BAM with its index (or a small BAM or SAM without one). The only required input.</p>
+					</div>
+					<div class="field-body">
+						<div class="segmented" role="radiogroup" aria-label="Reads from">
+							<button
+								role="radio"
+								aria-checked={readsFrom === "file"}
+								class:on={readsFrom === "file"}
+								onclick={() => (readsFrom = "file")}>From your computer</button
+							>
+							<button
+								role="radio"
+								aria-checked={readsFrom === "url"}
+								class:on={readsFrom === "url"}
+								onclick={() => (readsFrom = "url")}>From a URL</button
+							>
 						</div>
 						{#if readsFrom === "file"}
 							<input
@@ -662,24 +738,25 @@ const pct = (a, b) => (b ? `${((100 * a) / b).toFixed(1)}%` : "–");
 							/>
 							<div class="hint" class:bad={files.length && reads.error}>
 								{#if files.length && reads.error}{reads.error}
-								{:else if reads.index}{reads.alignments.name} + {reads.index.name}: only the locus is read from disk
+								{:else if reads.index}<span class="ok">✓</span>
+									{reads.alignments.name} + {reads.index.name}: only the locus is read from disk
 								{:else if files.length}{reads.alignments.name}: will be sorted and indexed in your browser (samtools)
-								{:else}The BAM you gave DeepVariant and its .bai: any size, since only the locus is read. Or a snippet made with
-									<code>samtools view -b</code> (keeps the full header); small files don't need an index.{/if}
+								{:else}The BAM you gave DeepVariant and its .bai, any size. Or a snippet made with <code>samtools view -b</code>;
+									small files don't need an index.{/if}
 							</div>
 						{:else}
 							<input type="text" class="url" placeholder="https://…/sample.bam" aria-label="BAM URL" bind:value={readsUrl} />
 							<input
 								type="text"
-								class="url mt-xs"
+								class="url"
 								placeholder="Index URL (default: the BAM's URL + .bai)"
 								aria-label="Index URL"
 								bind:value={indexUrl}
 							/>
 							<div class="hint" class:bad={readsUrl && reads.error}>
 								{#if readsUrl && reads.error}{reads.error}
-								{:else}Read with range requests, so only the locus is downloaded, whatever the BAM's size. The server must allow
-									range requests and requests from other sites (CORS): S3 and GCS buckets need a CORS rule allowing GET and HEAD.{/if}
+								{:else}Read with range requests, so only the locus is downloaded. The server must allow requests from other sites
+									(CORS): see the README for S3 and GCS.{/if}
 							</div>
 						{/if}
 						{#if readsSpan?.error}
@@ -689,10 +766,10 @@ const pct = (a, b) => (b ? `${((100 * a) / b).toFixed(1)}%` : "–");
 									: ""}
 							</div>
 						{:else if readsSpan?.chrom}
-							<div class="hint">Reads start at {readsSpan.chrom}:{fmt(readsSpan.start)}.</div>
+							<div class="hint">Reads start at <span class="mono">{readsSpan.chrom}:{fmt(readsSpan.start)}</span>.</div>
 						{/if}
 						{#if model.pangenome}
-							<label class="field mt-s" for="dvi-pangenome">Pangenome haplotypes <span class="hint">(.bam + .bai)</span></label>
+							<label class="sublabel" for="dvi-pangenome">Pangenome haplotypes <span class="hint">(.bam + .bai)</span></label>
 							<input
 								id="dvi-pangenome"
 								type="file"
@@ -702,24 +779,77 @@ const pct = (a, b) => (b ? `${((100 * a) / b).toFixed(1)}%` : "–");
 							/>
 							<div class="hint" class:bad={pangenomeFiles.length && pangenomeReads.error}>
 								{#if pangenomeFiles.length && pangenomeReads.error}{pangenomeReads.error}
-								{:else if pangenomeReads.index}{pangenomeReads.alignments.name} + {pangenomeReads.index.name}
+								{:else if pangenomeReads.index}<span class="ok">✓</span>
+									{pangenomeReads.alignments.name} + {pangenomeReads.index.name}
 								{:else}A GBZ is too big for the browser, but pangenome-aware DeepVariant also takes the haplotypes as a BAM. Make
-									one for your locus from the GBZ with <a href="https://github.com/jltsiren/gbz-base">gbz-base</a> and
+									one for your locus with <a href="https://github.com/jltsiren/gbz-base">gbz-base</a> and
 									<a href="{URL_DEEPVARIANT}/tools/gbz_haplotypes_bam.py" download>this script</a>.{/if}
 							</div>
 						{/if}
-						<label class="field mt-s" for="dvi-vcf">Your DeepVariant VCF <span class="hint">(optional, .vcf.gz)</span></label>
-						<input id="dvi-vcf" type="file" accept=".vcf,.gz,.bgz" onchange={(e) => loadVcf(e.target.files[0])} />
+					</div>
+				</div>
+
+				<div class="field-row">
+					<div class="field-label">
+						<h2><span class="num">3</span> Where to look</h2>
+						<p class="hint">Filled in from your files where possible</p>
+					</div>
+					<div class="field-body two">
+						<div>
+							<label class="sublabel" for="dvi-reference">Reference</label>
+							<select id="dvi-reference" value={referenceKey} onchange={(e) => (referenceKey = e.target.value)}>
+								{#each Object.entries(REFERENCES) as [key, ref] (key)}
+									<option value={key}>{ref.name}</option>
+								{/each}
+							</select>
+							<div class="hint">
+								{#if referenceDetected && readsSpan?.contigs}<span class="ok">✓</span> Detected from your BAM's header.{:else}Contig
+									names must match your BAM (chr1, not 1).{/if}
+							</div>
+						</div>
+						<div>
+							<label class="sublabel" for="dvi-region">Position <span class="hint">(optional)</span></label>
+							<input
+								id="dvi-region"
+								type="text"
+								bind:value={regionText}
+								placeholder={autoPosition
+									? autoPosition.text.replace(/\d+/g, (n) => fmt(Number(n)))
+									: "Empty: where your reads are"}
+							/>
+							<div class="hint" class:bad={region.error}>
+								{#if region.error}{region.error}
+								{:else if region.pending}Empty: runs where your reads are.
+								{:else if region.auto}Empty: {region.auto}.{:else}Runs on {region.text}.{/if}
+							</div>
+						</div>
+					</div>
+				</div>
+
+				<div class="field-row">
+					<div class="field-label">
+						<h2><span class="num optional">4</span> Your VCF <span class="hint">optional</span></h2>
+						<p class="hint">Finds the calls worth a closer look, and compares each with this run</p>
+					</div>
+					<div class="field-body">
+						<input
+							id="dvi-vcf"
+							type="file"
+							accept=".vcf,.gz,.bgz"
+							aria-label="Your DeepVariant VCF"
+							onchange={(e) => loadVcf(e.target.files[0])}
+						/>
 						<div class="hint" class:bad={vcfError}>
 							{#if vcfError}{vcfError}
 							{:else if vcfInput && !vcfScan}Reading {vcfInput.name}… {Math.round(vcfProgress * 100)}%
-							{:else if vcfScan}{vcfInput.name}: {fmt(vcfScan.stats.records)} calls{vcfScan.gvcf
+							{:else if vcfScan}<span class="ok">✓</span>
+								{vcfInput.name}: {fmt(vcfScan.stats.records)} calls{vcfScan.gvcf
 									? " (gVCF: variant records only)"
-									: ""}. Summary below.
-							{:else}Summarizes your calls, lists the ones worth a look, and compares each rerun call with yours.{/if}
+									: ""}{vcfScan.sample ? ` · ${vcfScan.sample}` : ""}
+							{:else}A .vcf or .vcf.gz from DeepVariant.{/if}
 						</div>
 						{#if model.captureRegions}
-							<label class="field mt-s" for="dvi-capture"
+							<label class="sublabel" for="dvi-capture"
 								>Capture BED <span class="hint">(optional, as given to --regions)</span></label
 							>
 							<input
@@ -731,102 +861,155 @@ const pct = (a, b) => (b ? `${((100 * a) / b).toFixed(1)}%` : "–");
 							<div class="hint">
 								{capture.length
 									? `${fmt(capture.length)} intervals: each run uses the one around your position, as your WES run did.`
-									: "WES runs process each capture interval on its own, so give the BED to reproduce your run exactly."}
+									: "WES runs process each capture interval on its own; give the BED to reproduce your run exactly."}
 							</div>
 						{/if}
 					</div>
-				{/if}
-			</div>
-			<div>
-				<label class="field" for="dvi-reference">Reference</label>
-				<!-- The examples run on hg38, so show that while one is picked -->
-				<select
-					id="dvi-reference"
-					value={source === "example" ? EXAMPLE_REFERENCE : referenceKey}
-					onchange={(e) => (referenceKey = e.target.value)}
-					disabled={source === "example"}
-				>
-					{#each Object.entries(REFERENCES) as [key, ref] (key)}
-						<option value={key}>{ref.name}</option>
-					{/each}
-				</select>
-				<div class="hint">
-					{#if source === "upload" && referenceDetected && readsSpan?.contigs}Detected from your BAM's header.{:else}Contig names
-						must match your BAM (chr1, not 1).{/if} Only the region's sequence is downloaded.
 				</div>
 
-				<label class="field mt" for="dvi-region"
-					>Position{#if source === "upload"}&nbsp;<span class="hint">(optional)</span>{/if}</label
-				>
-				<input
-					id="dvi-region"
-					type="text"
-					bind:value={regionText}
-					disabled={source === "example"}
-					placeholder={autoPosition ? autoPosition.text.replace(/\d+/g, (n) => fmt(Number(n))) : "Empty: where your reads are"}
-				/>
-				<div class="hint" class:bad={region.error}>
-					{#if region.error}{region.error}
-					{:else if region.pending}Leave it empty to run where your reads are, or enter a position like chr20:26,263,468.
-					{:else}{#if region.auto}No position given, so {region.auto}.{/if} Runs on {region.text}: {region.why}, so the
-						calls match a real run's.{/if}
-				</div>
-			</div>
-		</div>
-		<div class="run-row">
-			<button class="run" onclick={runDeepVariant} disabled={!canRun}
-				>{!ready ? "Loading DeepVariant…" : busy ? "Running…" : "Run DeepVariant"}</button
-			>
-			<div class="steps">
-				{#each Object.entries(STEP_NAMES) as [key, label] (key)}
-					<span class="step {steps[key] ?? 'pending'}">{Array.isArray(label) ? label[steps[key] === "done" ? 1 : 0] : label}</span>
-				{/each}
-				{#if busy}<span class="hint">{busy}</span>{/if}
-			</div>
-		</div>
-		{#if error}<div class="bad">Failed: {error.replace(/^Error: /, "")}</div>{/if}
-	</section>
-
-	<!-- Your VCF -->
-	{#if vcfScan}
-		{@const s = vcfScan.stats}
-		{@const pass = s.filter.PASS ?? 0}
-		<section class="card-dvi">
-			<h2>Your calls: {vcfInput.name}{vcfScan.sample ? ` (${vcfScan.sample})` : ""}</h2>
-			{#if !vcfScan.isDeepVariant}<p class="bad">
-					This VCF has no ##DeepVariant_version line: it may not come from DeepVariant.
-				</p>{/if}
-			<div class="tiles">
-				<div class="tile"><b>{fmt(pass)}</b>PASS calls</div>
-				<div class="tile"><b>{fmt(s.pass.snp)}</b>SNPs</div>
-				<div class="tile"><b>{fmt(s.pass.indel)}</b>indels</div>
-				<div class="tile">
-					<b>{s.pass.transversions ? (s.pass.transitions / s.pass.transversions).toFixed(2) : "–"}</b>Ti/Tv (SNPs)
-				</div>
-				<div class="tile"><b>{s.pass.homAlt ? (s.pass.het / s.pass.homAlt).toFixed(2) : "–"}</b>het / hom-alt</div>
-				<div class="tile"><b>{pct(s.mid.small_model ?? 0, pass)}</b>called by the small model</div>
-				<div class="tile"><b>{fmt(s.filter.RefCall ?? 0)}</b>RefCall</div>
-				<div class="tile"><b>{fmt(s.filter.NoCall ?? 0)}</b>NoCall</div>
-			</div>
-			<div class="gq">
-				<span class="hint">GQ of PASS calls</span>
-				<div class="bars" role="img" aria-label="Histogram of GQ for PASS calls">
-					{#each s.gqHistogram as n, i (i)}
-						<div class="bar-col" title="GQ {i * 10}–{i * 10 + 9}: {fmt(n)} calls">
-							<div class="bar" class:low={i < GQ_LOW / 10} style="height: {(100 * n) / Math.max(...s.gqHistogram, 1)}%"></div>
-							<span>{i * 10}</span>
+				<div class="run-row">
+					<div class="run-about">
+						{#if region.text}<span class="hint"
+								>Runs on <span class="mono">{region.text}</span>: {region.why}, so the calls match a real run's.</span
+							>{/if}
+						<div class="steps">
+							{#each Object.entries(STEP_NAMES) as [key, label] (key)}
+								<span class="step {steps[key] ?? 'pending'}"
+									>{Array.isArray(label) ? label[steps[key] === "done" ? 1 : 0] : label}</span
+								>
+							{/each}
 						</div>
+					</div>
+					<button class="run" onclick={runDeepVariant} disabled={!canRun}
+						>{!ready ? "Loading DeepVariant…" : busy ? "Running…" : "Run DeepVariant"}</button
+					>
+				</div>
+				{#if busy}<p class="hint">{busy}</p>{/if}
+				{#if error}<p class="bad">Failed: {error.replace(/^Error: /, "")}</p>{/if}
+			</section>
+		{:else}
+			<div class="summary-bar">
+				<span class="ok">✓ DeepVariant 1.10 ran</span>
+				<span><span class="muted">Model</span> {ranModel.name}</span>
+				<span><span class="muted">Reads</span> <span class="mono">{fileName(reads)}</span></span>
+				<span><span class="muted">Ref</span> {reference.name}</span>
+				<span><span class="muted">Region</span> <span class="mono">{ranRegion}</span></span>
+				{#if vcfScan}<span><span class="muted">VCF</span> <span class="mono">{vcfInput.name}</span></span>{/if}
+				<button class="link push" onclick={() => (editing = true)}>Change inputs</button>
+			</div>
+		{/if}
+	{/if}
+
+	<div class="workspace">
+		<!-- Left: the examples, by model; or with your data, your VCF's calls worth a look -->
+		{#if source === "example"}
+			{@const shown = modelByKey(openModel) ?? model}
+			<aside class="card side" aria-label="Examples by model">
+				<div class="side-head">
+					<h2>Examples</h2>
+					<span class="hint">HG003 · GRCh38 · chr20</span>
+				</div>
+				<div class="tiles-models" role="radiogroup" aria-label="Model">
+					{#each TILE_ORDER as m (m.key)}
+						<button
+							class="tile-model"
+							class:active={m.key === shown.key}
+							role="radio"
+							aria-checked={m.key === shown.key}
+							onclick={() => (openModel = m.key)}
+						>
+							<span class="tile-top">
+								<svg width="26" height="12" viewBox="0 0 26 12" aria-hidden="true">
+									{#if m.reads === "short"}
+										<rect class="sr" x="0" y="1" width="7" height="3" rx="1" /><rect
+											class="sr"
+											x="9"
+											y="1"
+											width="7"
+											height="3"
+											rx="1"
+										/><rect class="sr" x="4" y="7" width="7" height="3" rx="1" /><rect
+											class="sr"
+											x="14"
+											y="7"
+											width="7"
+											height="3"
+											rx="1"
+										/>
+									{:else if m.reads === "long"}
+										<rect class="lr" x="0" y="1" width="24" height="3" rx="1" /><rect
+											class="lr"
+											x="3"
+											y="7"
+											width="23"
+											height="3"
+											rx="1"
+										/>
+									{:else}
+										<rect class="lr" x="0" y="1" width="24" height="3" rx="1" /><rect
+											class="sr"
+											x="2"
+											y="7"
+											width="7"
+											height="3"
+											rx="1"
+										/><rect class="sr" x="12" y="7" width="7" height="3" rx="1" />
+									{/if}
+								</svg>
+								<span class="hint">{m.examples.length}</span>
+							</span>
+							<span class="tile-name">{m.short}</span>
+						</button>
 					{/each}
 				</div>
-			</div>
-			<h2 class="mt">Calls worth a closer look: click one to rerun DeepVariant there</h2>
-			<div class="tabs" role="tablist">
-				{#each Object.entries(LISTS) as [key, l] (key)}
-					<button role="tab" class:active={key === listKey} aria-selected={key === listKey} onclick={() => (listKey = key)}
-						>{l.name}
-						<span class="count">{fmt(vcfScan.lists[key].length)}{vcfScan.lists[key].length === LIST_MAX ? "+" : ""}</span></button
-					>
-				{/each}
+				<div class="model-card" title={shown.about}>
+					<span class="model-card-name">{shown.name}</span>
+					<div class="facts">
+						{#each facts(shown) as f (f)}<span class="fact">{f}</span>{/each}
+					</div>
+					<a class="hint" href={shown.caseStudy}>Case study</a>
+				</div>
+				<div class="ex-list">
+					{#each shown.examples as ex, i (ex.pos)}
+						{@const active = shown.key === modelKey && i === exampleIndex}
+						<button class="ex" class:active aria-current={active} onclick={() => inspectExample(shown.key, i)}>
+							<span class="ex-label">{ex.label}</span>
+							<span class="kind {kindClass(ex.kind)}">{KIND_TAGS[ex.kind]}</span>
+							<span class="mono ex-pos">{fmt(ex.pos)}</span>
+						</button>
+					{/each}
+				</div>
+				<p class="hint side-foot">
+					Sites where DeepVariant 1.10's official case-study run disagrees with GIAB v4.2.1, or isn't sure. Short reads
+					<span class="key sr-key"></span> · long reads <span class="key lr-key"></span>
+				</p>
+			</aside>
+		{:else if vcfScan}
+			{@const s = vcfScan.stats}
+			{@const pass = s.filter.PASS ?? 0}
+			<aside class="card side" aria-label="Your calls">
+				<div class="side-head">
+					<h2>Worth a closer look</h2>
+					<span class="hint">{vcfInput.name}</span>
+				</div>
+				{#if !vcfScan.isDeepVariant}<p class="bad">
+						This VCF has no ##DeepVariant_version line: it may not come from DeepVariant.
+					</p>{/if}
+				<div class="chips" role="tablist">
+					{#each Object.entries(LISTS) as [key, l] (key)}
+						<button
+							role="tab"
+							class="chip"
+							class:on={key === listKey}
+							aria-selected={key === listKey}
+							onclick={() => (listKey = key)}
+							>{l.name}
+							<span class="count">{fmt(vcfScan.lists[key].length)}{vcfScan.lists[key].length === LIST_MAX ? "+" : ""}</span
+							></button
+						>
+					{/each}
+				</div>
+				<p class="hint">{LISTS[listKey].about}. Click one to rerun DeepVariant there.</p>
 				<input
 					type="text"
 					class="filter"
@@ -834,192 +1017,296 @@ const pct = (a, b) => (b ? `${((100 * a) / b).toFixed(1)}%` : "–");
 					aria-label="Filter by position"
 					bind:value={listFilter}
 				/>
-			</div>
-			<p class="hint">
-				{LISTS[listKey].about}.{source === "example" || reads.error ? " Add your reads above to rerun DeepVariant on these." : ""}
-			</p>
-			<div class="tablewrap short">
-				<table>
-					<thead>
-						<tr
-							><th>position</th><th>ref</th><th>alt</th><th>filter</th><th>genotype</th><th>GQ</th><th>depth</th><th>called by</th
-							></tr
+				<div class="list">
+					{#each listShown as r (`${r.chrom}:${r.pos}:${r.alt}`)}
+						<button
+							class="call-row"
+							class:active={selected && selected.pos === r.pos && selected.chrom === r.chrom}
+							onclick={() => inspectRecord(r)}
 						>
-					</thead>
-					<tbody>
-						{#each listShown as r (`${r.chrom}:${r.pos}:${r.alt}`)}
-							<tr tabindex="0" onclick={() => inspectRecord(r)} onkeydown={(e) => e.key === "Enter" && inspectRecord(r)}>
-								<td>{r.chrom}:{fmt(r.pos)}</td><td class="allele">{r.ref}</td><td class="allele">{r.alt}</td><td>{r.filter}</td
-								><td>{r.GT}</td><td class="num">{r.GQ}</td><td class="num">{r.DP}</td><td>{modelName(r.MID)}</td>
-							</tr>
-						{:else}
-							<tr><td colspan="8" class="hint">None.</td></tr>
-						{/each}
-					</tbody>
-				</table>
-			</div>
-		</section>
-	{/if}
-
-	<!-- Calls of this run -->
-	{#if calls.length}
-		<section class="card-dvi">
-			<div class="title-row">
-				<h2>DeepVariant's calls in {ranRegion} ({ranModel.modelType} model): click one to inspect it</h2>
-				<button class="link" onclick={copyLink}>{linkCopied ? "Link copied" : "Copy link to this locus"}</button>
-			</div>
-			<div class="tablewrap">
-				<table>
-					<thead>
-						<tr
-							><th>position</th><th>ref</th><th>alt</th><th>genotype</th><th>GQ</th><th>QUAL</th><th>filter</th><th>depth</th><th
-								>allele depths</th
-							><th>called by</th>{#if yourRecords}<th>your VCF</th>{/if}</tr
-						>
-					</thead>
-					<tbody>
-						{#each calls as call (`${call.pos}:${call.alt}`)}
-							{@const yours = yourRecords ? yoursFor(call) : null}
-							<tr
-								class:active={call === selected}
-								class:filtered={call.filter !== "PASS"}
-								tabindex="0"
-								onclick={() => select(call)}
-								onkeydown={(e) => e.key === "Enter" && select(call)}
-							>
-								<td>{call.chrom}:{fmt(call.pos)}</td><td class="allele">{call.ref}</td><td class="allele">{call.alt}</td><td
-									>{call.GT}</td
-								><td class="num">{call.GQ}</td><td class="num">{call.qual}</td><td>{call.filter}</td><td class="num">{call.DP}</td
-								><td>{call.AD}</td><td>{modelName(call.MID)}</td>
-								{#if yourRecords}
-									<td class:differs={yours && !agrees(call)}
-										>{#if !yours}<span class="hint">not in your VCF</span>{:else}{yours.GT} {yours.filter} GQ {yours.GQ}{/if}</td
-									>
-								{/if}
-							</tr>
-						{/each}
-					</tbody>
-				</table>
-			</div>
-		</section>
-	{:else if finished}
-		<section class="card-dvi"><p class="hint">No candidate variants in {ranRegion}.</p></section>
-	{/if}
-
-	<!-- The selected call -->
-	{#if selected}
-		{@const probs = genotypeProbabilities(selected)}
-		{@const yours = yourRecords ? yoursFor(selected) : null}
-		<section class="card-dvi">
-			<h2>
-				{selected.chrom}:{fmt(selected.pos)}
-				{selected.ref} → {selected.alt} · {selected.GT} · GQ {selected.GQ} · {selected.filter} · called by the {modelName(
-					selected.MID
-				)}
-			</h2>
-			<div class="detail">
-				<div>
-					<h3>Genotype probabilities</h3>
-					<div class="probs">
-						{#each probs as { gt, p } (gt)}
-							<div class="prob" title="{gt}: {p.toPrecision(3)}">
-								<span class="gt">{gt}</span>
-								<div class="prob-bar"><div style="width: {Math.max(0.5, p * 100)}%"></div></div>
-								<span class="p">{p >= 0.001 ? `${(p * 100).toFixed(1)}%` : p.toExponential(0)}</span>
+							<span class="mono">{r.chrom}:{fmt(r.pos)}</span>
+							<span class="mono allele">{r.ref} → {r.alt}</span>
+							<span class="mono gt">{r.GT}</span>
+							<span class="mono num" class:low={Number(r.GQ) < GQ_LOW}>{r.GQ}</span>
+						</button>
+					{:else}
+						<p class="hint">None.</p>
+					{/each}
+				</div>
+				<details class="vcf-summary">
+					<summary
+						>Summary · {fmt(pass)} PASS · Ti/Tv {s.pass.transversions
+							? (s.pass.transitions / s.pass.transversions).toFixed(2)
+							: "–"}</summary
+					>
+					<div class="tiles">
+						<div class="tile"><b>{fmt(s.pass.snp)}</b>SNPs</div>
+						<div class="tile"><b>{fmt(s.pass.indel)}</b>indels</div>
+						<div class="tile"><b>{s.pass.homAlt ? (s.pass.het / s.pass.homAlt).toFixed(2) : "–"}</b>het / hom-alt</div>
+						<div class="tile"><b>{pct(s.mid.small_model ?? 0, pass)}</b>small model</div>
+						<div class="tile"><b>{fmt(s.filter.RefCall ?? 0)}</b>RefCall</div>
+						<div class="tile"><b>{fmt(s.filter.NoCall ?? 0)}</b>NoCall</div>
+					</div>
+					<span class="hint">GQ of PASS calls</span>
+					<div class="bars" role="img" aria-label="Histogram of GQ for PASS calls">
+						{#each s.gqHistogram as n, i (i)}
+							<div class="bar-col" title="GQ {i * 10}–{i * 10 + 9}: {fmt(n)} calls">
+								<div class="bar" class:low={i < GQ_LOW / 10} style="height: {(100 * n) / Math.max(...s.gqHistogram, 1)}%"></div>
+								<span>{i * 10}</span>
 							</div>
 						{/each}
 					</div>
-					<p class="hint">
-						From PL. GQ {selected.GQ} means a {(10 ** (-Number(selected.GQ) / 10) * 100).toPrecision(2)}% chance the top genotype
-						is wrong.
-						{#if selected.filter === "NoCall"}NoCall (./.): no genotype was likely enough to call.{/if}
-						{#if selected.filter === "RefCall"}RefCall: DeepVariant thinks this candidate is reference.{/if}
-					</p>
-				</div>
-				<div>
-					<h3>How it was called</h3>
-					<p>
-						{#if selected.MID === "small_model"}
-							By the <b>small model</b>, from summary features (allele counts, base and mapping qualities) instead of a pileup
-							image: DeepVariant uses it for candidates it can call confidently and sends the rest to the CNN.
-						{:else}
-							By the <b>CNN</b>, from the pileup images below (one per alternate allele, or pair of them).
-						{/if}
-					</p>
-					{#if readsInfo?.kind === "realigned"}
-						<p>
-							{#if readsInfo.changed}
-								Local realignment changed <b>{readsInfo.changed} of {readsInfo.total}</b> reads in {readsInfo.window}: compare the
-								two read tracks in IGV to see how.
-							{:else}
-								Local realignment changed <b>none of the {readsInfo.total}</b> reads in {readsInfo.window}: DeepVariant saw them
-								as IGV shows them.
-							{/if}
-							<a href={readsInfo.url} download="realigned_reads.bam">Download the realigned reads</a>.
-						</p>
-					{:else if readsInfo?.kind === "phased"}
-						<p>
-							Long reads aren't realigned. DeepVariant phases them itself and sorts the pileup rows by haplotype; IGV groups them
-							the same way (HP tag). <a href={readsInfo.url} download="phased_by_deepvariant.bam">Download the phased reads</a>.
-						</p>
-					{/if}
-					{#if run.model.pangenome}
-						<p>
-							Pangenome-aware: the top half of each pileup image is the pangenome's haplotypes here, the bottom half your reads.
-						</p>
-					{/if}
-					{#if yourRecords}
-						<h3>Your VCF</h3>
-						{#if !yours}
-							<p>Your VCF has no record here.</p>
-						{:else if agrees(selected)}
-							<p class="ok">Same call: {yours.GT}, {yours.filter}, GQ {yours.GQ}.</p>
-						{:else}
-							<p class="differs">
-								Your VCF says {yours.GT}, {yours.filter}, GQ {yours.GQ}. Differences can come from another DeepVariant version,
-								model or flags; and where more reads cover a site than fit in a pileup image, from which reads DeepVariant
-								sampled.
-							</p>
-						{/if}
-					{/if}
-				</div>
-			</div>
+				</details>
+			</aside>
+		{/if}
 
-			<h3 class="mt">Pileup images</h3>
-			{#if selected.MID === "small_model"}
-				<p class="hint">None: the small model called this from summary features, so the CNN never looked at a pileup image.</p>
-			{:else if pileupError}
-				<p class="bad">Couldn't draw the pileup images: {pileupError}</p>
-			{:else if pileupsForSelected.length}
-				<p class="hint">
-					What the CNN classified (DeepVariant's show_examples): rows are {run.model.pangenome
-						? "pangenome haplotypes, then your reads"
-						: "reads"}, columns are positions centered on the candidate, and each panel is one channel:
-				</p>
-				<ol class="channels">
-					{#each run.model.channels as ch (ch)}
-						<li><b>{CHANNELS[ch]?.name ?? `channel ${ch}`}</b>: {CHANNELS[ch]?.about ?? ""}</li>
-					{/each}
-				</ol>
-				{#each pileupsForSelected as p (p.name)}
-					<figure>
-						<a href={p.url} download="{p.name}.png"><img src={p.url} alt="pileup image {p.name}" /></a>
-						<figcaption>{p.name}</figcaption>
-					</figure>
-				{/each}
-			{:else}
-				<p class="hint">Drawing pileup images…</p>
+		<section class="main" aria-label="Selected call">
+			<!-- The example: what's hard about it, and how each call compares -->
+			{#if source === "example"}
+				<div class="card">
+					<div class="head-row">
+						<div>
+							<span class="hint">{model.name} example</span>
+							<h1>{example.what.charAt(0).toUpperCase() + example.what.slice(1)}</h1>
+							<span class="mono sub">chr20:{fmt(example.pos)} · runs on {exampleRegion(model, example)}</span>
+						</div>
+						<button class="secondary" onclick={copyLink}>{linkCopied ? "Link copied" : "Copy link"}</button>
+					</div>
+					<div class="compare">
+						<div><span class="hint">Truth · GIAB v4.2.1</span><b class="mono">{example.truth}</b></div>
+						<div class="official"><span class="hint">Official case-study run</span><b class="mono">{example.official}</b></div>
+						<div>
+							<span class="hint">This run, in your browser</span>
+							{#if busy || !ready}<b class="muted">{!ready ? "Loading DeepVariant…" : "Running…"}</b>
+							{:else if ranExample === example && exampleCall}<b class="mono">{callText(exampleCall)}</b>
+							{:else if ranExample === example && finished}<b class="muted">No candidate here</b>
+							{:else}<b class="muted">–</b>{/if}
+						</div>
+					</div>
+					{#if example.note || elsewhere.length}
+						<div class="note">
+							{#if example.note}<p>{example.note}</p>{/if}
+							{#each elsewhere as o (o.model.key)}
+								<button class="link" onclick={() => inspectExample(o.model.key, o.index)}>Same site with {o.model.name} →</button>
+							{/each}
+						</div>
+					{/if}
+					{#if busy || !finished}
+						<div class="steps">
+							{#each Object.entries(STEP_NAMES) as [key, label] (key)}
+								<span class="step {steps[key] ?? 'pending'}"
+									>{Array.isArray(label) ? label[steps[key] === "done" ? 1 : 0] : label}</span
+								>
+							{/each}
+							{#if busy}<span class="hint">{busy}</span>{/if}
+						</div>
+					{/if}
+					{#if error}<p class="bad">Failed: {error.replace(/^Error: /, "")}</p>{/if}
+				</div>
 			{/if}
 
-			<h3 class="mt">In IGV</h3>
-			<div class="igv" bind:this={divIgv}></div>
-		</section>
-	{/if}
+			{#if selected}
+				{@const probs = genotypeProbabilities(selected)}
+				{@const yours = yourRecords ? yoursFor(selected) : null}
+				<div class="card">
+					<div class="head-row">
+						<div>
+							<span class="hint">{source === "example" ? "This run's call" : `${ranModel.name} · ${ranRegion}`}</span>
+							<h2 class="call-title mono">
+								{selected.chrom}:{fmt(selected.pos)} <span class="muted">{selected.ref} → {selected.alt}</span>
+							</h2>
+						</div>
+						{#if source === "upload"}<button class="secondary" onclick={copyLink}
+								>{linkCopied ? "Link copied" : "Copy link"}</button
+							>{/if}
+					</div>
+					<div class="stats">
+						<div><span class="hint">Genotype</span><b class="mono">{selected.GT}</b></div>
+						<div>
+							<span class="hint">GQ</span><b>{selected.GQ}</b>
+							<span class="hint">{(10 ** (-Number(selected.GQ) / 10) * 100).toPrecision(2)}% chance it's wrong</span>
+						</div>
+						<div><span class="hint">Filter · QUAL</span><b>{selected.filter} · {selected.qual}</b></div>
+						<div><span class="hint">Depth · allele depths</span><b>{selected.DP} · {selected.AD}</b></div>
+						<div><span class="hint">Called by</span><b>{modelName(selected.MID)}</b></div>
+					</div>
+					<div class="detail">
+						<div>
+							<h3>Genotype probabilities</h3>
+							<div class="probs">
+								{#each probs as { gt, p } (gt)}
+									<div class="prob" title="{gt}: {p.toPrecision(3)}">
+										<span class="gt">{gt}</span>
+										<div class="prob-bar"><div style="width: {Math.max(0.5, p * 100)}%"></div></div>
+										<span class="p">{p >= 0.001 ? `${(p * 100).toFixed(1)}%` : p.toExponential(0)}</span>
+									</div>
+								{/each}
+							</div>
+							<p class="hint">
+								From PL.
+								{#if selected.filter === "NoCall"}NoCall (./.): no genotype was likely enough to call.{/if}
+								{#if selected.filter === "RefCall"}RefCall: DeepVariant thinks this candidate is reference.{/if}
+							</p>
+						</div>
+						<div>
+							<h3>How it was called</h3>
+							<ul class="how">
+								<li>
+									{#if selected.MID === "small_model"}
+										By the <b>small model</b>, from summary features (allele counts, base and mapping qualities) instead of a
+										pileup image: DeepVariant uses it for candidates it can call confidently.
+									{:else}
+										By the <b>CNN</b>, from the pileup images (one per alternate allele, or pair of them).
+									{/if}
+								</li>
+								{#if readsInfo?.kind === "realigned"}
+									<li>
+										Local realignment changed <b
+											>{readsInfo.changed ? `${readsInfo.changed} of ${readsInfo.total}` : `none of the ${readsInfo.total}`}</b
+										>
+										reads in <span class="mono">{readsInfo.window}</span>.
+										<a href={readsInfo.url} download="realigned_reads.bam">Download the realigned reads</a>
+									</li>
+								{:else if readsInfo?.kind === "phased"}
+									<li>
+										Not realigned: DeepVariant phases long reads itself and sorts the pileup rows by haplotype.
+										<a href={readsInfo.url} download="phased_by_deepvariant.bam">Download the phased reads</a>
+									</li>
+								{/if}
+								{#if ranModel.pangenome}
+									<li>
+										Pangenome-aware: the top half of each pileup image is the pangenome's haplotypes, the bottom half the reads.
+									</li>
+								{/if}
+							</ul>
+							{#if yourRecords}
+								<h3>Your VCF</h3>
+								{#if !yours}
+									<p class="hint">No record here.</p>
+								{:else if agrees(selected)}
+									<p class="ok">Same call: {yours.GT}, {yours.filter}, GQ {yours.GQ}.</p>
+								{:else}
+									<p class="differs">
+										Yours says {yours.GT}, {yours.filter}, GQ {yours.GQ}. Differences can come from another DeepVariant version,
+										model or flags; and where more reads cover a site than fit in a pileup image, from which reads were sampled.
+									</p>
+								{/if}
+							{/if}
+						</div>
+					</div>
+				</div>
+			{:else if finished && !calls.length}
+				<div class="card"><p class="hint">No candidate variants in {ranRegion}.</p></div>
+			{:else if source === "upload" && !busy && !finished && !editing}
+				<div class="card"><p class="hint">Pick a call on the left, or run DeepVariant above.</p></div>
+			{/if}
 
-	<details class="card-dvi">
-		<summary>Log</summary>
-		<pre>{logText}</pre>
-	</details>
+			<!-- What DeepVariant looked at -->
+			<div class="card tabs-card">
+				<div class="tabs" role="tablist">
+					{#if calls.length}
+						<button role="tab" class:on={tab === "reads"} aria-selected={tab === "reads"} onclick={() => showTab("reads")}
+							>{ranModel?.realigns ? "Reads: before vs after realignment" : "Reads: as aligned vs phased"}</button
+						>
+						<button role="tab" class:on={tab === "pileups"} aria-selected={tab === "pileups"} onclick={() => showTab("pileups")}
+							>Pileup images {#if pileupsForSelected.length}<span class="count">{pileupsForSelected.length}</span>{/if}</button
+						>
+						<button role="tab" class:on={tab === "calls"} aria-selected={tab === "calls"} onclick={() => showTab("calls")}
+							>All calls in this region <span class="count">{calls.length}</span></button
+						>
+					{/if}
+					<button
+						role="tab"
+						class:on={tab === "log" || !calls.length}
+						aria-selected={tab === "log"}
+						onclick={() => showTab("log")}>Log</button
+					>
+				</div>
+
+				{#if calls.length}
+					<div class="panel" hidden={tab !== "reads"}>
+						<p class="hint">
+							{#if ranModel?.realigns}Your reads as IGV shows them, and after DeepVariant's local realignment: what it saw.{:else}Your
+								reads as aligned, and as DeepVariant phased them (grouped by haplotype, as the pileup rows are).{/if}
+						</p>
+						<div class="igv" bind:this={divIgv}></div>
+					</div>
+
+					<div class="panel" hidden={tab !== "pileups"}>
+						{#if selected?.MID === "small_model"}
+							<p class="hint">
+								None: the small model called this from summary features, so the CNN never looked at a pileup image.
+							</p>
+						{:else if pileupError}
+							<p class="bad">Couldn't draw the pileup images: {pileupError}</p>
+						{:else if pileupsForSelected.length}
+							<p class="hint">
+								What the CNN classified (show_examples): rows are {ranModel.pangenome
+									? "pangenome haplotypes, then reads"
+									: "reads"}, columns are positions centered on the candidate, and each panel is one channel:
+							</p>
+							<ol class="channels">
+								{#each ranModel.channels as ch (ch)}
+									<li title={CHANNELS[ch]?.about ?? ""}><b>{CHANNELS[ch]?.name ?? `channel ${ch}`}</b></li>
+								{/each}
+							</ol>
+							{#each pileupsForSelected as p (p.name)}
+								<figure>
+									<a href={p.url} download="{p.name}.png"><img src={p.url} alt="pileup image {p.name}" /></a>
+									<figcaption>{p.name}</figcaption>
+								</figure>
+							{/each}
+						{:else}
+							<p class="hint">Drawing pileup images…</p>
+						{/if}
+					</div>
+
+					<div class="panel" hidden={tab !== "calls"}>
+						<p class="hint">Every call in {ranRegion} ({ranModel.modelType} model). Click one to inspect it.</p>
+						<div class="tablewrap">
+							<table>
+								<thead>
+									<tr
+										><th>position</th><th>ref</th><th>alt</th><th>genotype</th><th>GQ</th><th>QUAL</th><th>filter</th><th
+											>depth</th
+										><th>allele depths</th><th>called by</th>{#if yourRecords}<th>your VCF</th>{/if}</tr
+									>
+								</thead>
+								<tbody>
+									{#each calls as call (`${call.pos}:${call.alt}`)}
+										{@const yours = yourRecords ? yoursFor(call) : null}
+										<tr
+											class:active={call === selected}
+											class:filtered={call.filter !== "PASS"}
+											tabindex="0"
+											onclick={() => select(call)}
+											onkeydown={(e) => e.key === "Enter" && select(call)}
+										>
+											<td>{call.chrom}:{fmt(call.pos)}</td><td class="allele">{call.ref}</td><td class="allele">{call.alt}</td><td
+												>{call.GT}</td
+											><td class="num">{call.GQ}</td><td class="num">{call.qual}</td><td>{call.filter}</td><td class="num"
+												>{call.DP}</td
+											><td>{call.AD}</td><td>{modelName(call.MID)}</td>
+											{#if yourRecords}
+												<td class:differs={yours && !agrees(call)}
+													>{#if !yours}<span class="hint">not in your VCF</span>{:else}{yours.GT}
+														{yours.filter} GQ {yours.GQ}{/if}</td
+												>
+											{/if}
+										</tr>
+									{/each}
+								</tbody>
+							</table>
+						</div>
+					</div>
+				{/if}
+
+				<div class="panel" hidden={calls.length && tab !== "log"}>
+					<pre>{logText || "Nothing yet."}</pre>
+				</div>
+			</div>
+		</section>
+	</div>
 </div>
 
 <style>
@@ -1028,7 +1315,7 @@ const pct = (a, b) => (b ? `${((100 * a) / b).toFixed(1)}%` : "–");
 	--muted: var(--fg-muted);
 	--done: var(--ok);
 	--error: var(--danger);
-	max-width: 1100px;
+	max-width: 1360px;
 	margin: 0 auto;
 	padding: 24px 16px 48px;
 	font:
@@ -1037,67 +1324,164 @@ const pct = (a, b) => (b ? `${((100 * a) / b).toFixed(1)}%` : "–");
 		sans-serif;
 }
 h1 {
-	font-size: 20px;
-	margin: 0 0 4px;
+	font-size: 22px;
+	line-height: 1.25;
+	margin: 2px 0 4px;
 }
 h2 {
-	font-size: 14px;
+	font-size: 15px;
 	font-weight: 600;
-	margin: 0 0 10px;
+	margin: 0;
 }
 h3 {
 	font-size: 13px;
 	font-weight: 600;
-	margin: 0 0 6px;
+	margin: 0 0 8px;
 }
-.mt {
-	margin-top: 18px;
+p {
+	margin: 0;
 }
-.mt-s {
-	margin-top: 10px;
+.mono {
+	font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
 }
-.sub {
+.muted {
 	color: var(--muted);
-	margin: 0 0 20px;
 }
-.step-num {
-	display: inline-grid;
-	place-items: center;
-	width: 18px;
-	height: 18px;
-	margin-right: 4px;
-	border-radius: 50%;
-	background: var(--accent);
-	color: #fff;
-	font-size: 11px;
+.hint {
+	color: var(--muted);
+	font-size: 12px;
+	font-weight: 400;
 }
-.card-dvi {
+.bad,
+.differs {
+	color: var(--error);
+}
+.ok {
+	color: var(--done);
+}
+.card {
 	background: var(--bg);
 	border: 1px solid var(--line);
-	border-radius: 10px;
-	padding: 16px;
-	margin-bottom: 16px;
+	border-radius: 12px;
+	padding: 20px 22px;
+}
+button {
+	font: inherit;
+	color: inherit;
+}
+button.link {
+	border: 0;
+	padding: 4px 0;
+	background: none;
+	color: var(--accent);
+	font-size: 13px;
+	font-weight: 500;
+	cursor: pointer;
+	text-align: left;
+}
+button.secondary {
+	padding: 8px 12px;
+	border: 1px solid var(--line);
+	border-radius: 8px;
+	background: var(--bg);
+	font-size: 13px;
+	font-weight: 500;
+	cursor: pointer;
+	white-space: nowrap;
+}
+button:focus-visible {
+	outline: 2px solid var(--accent);
+	outline-offset: 2px;
+}
+
+/* Your data: the inputs */
+.setup {
+	max-width: 920px;
+	margin: 0 auto 24px;
+	padding: 24px 28px;
+}
+.back {
+	border: 0;
+	padding: 4px 0;
+	background: none;
+	color: var(--accent);
+	font-size: 13px;
+	font-weight: 500;
+	cursor: pointer;
+}
+.lead {
+	color: var(--muted);
+	font-size: 15px;
+	max-width: 680px;
+	margin-bottom: 8px;
+}
+.field-row {
+	display: flex;
+	flex-wrap: wrap;
+	gap: 10px 32px;
+	padding: 20px 0;
+	border-top: 1px solid var(--line);
+}
+.field-label {
+	flex: 1 1 180px;
+}
+.field-label .hint {
+	margin: 4px 0 0 28px;
+}
+.field-body {
+	flex: 999 1 460px;
+	min-width: 0;
+	display: flex;
+	flex-direction: column;
+	gap: 8px;
+}
+.field-body.two {
+	display: grid;
+	grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+	gap: 16px;
+}
+.num {
+	display: inline-grid;
+	place-items: center;
+	width: 20px;
+	height: 20px;
+	margin-right: 6px;
+	border-radius: 50%;
+	background: var(--fg);
+	color: var(--bg);
+	font-size: 11px;
+}
+.num.optional {
+	background: none;
+	color: var(--muted);
+	border: 1.5px dashed var(--muted);
+}
+.sublabel {
+	display: block;
+	font-size: 13px;
+	font-weight: 500;
+	margin: 6px 0 6px;
 }
 .models {
 	display: grid;
-	grid-template-columns: repeat(auto-fill, minmax(140px, 1fr));
+	grid-template-columns: repeat(auto-fill, minmax(165px, 1fr));
 	gap: 8px;
 }
 .model {
 	display: flex;
 	flex-direction: column;
 	align-items: flex-start;
-	gap: 2px;
-	padding: 8px 10px;
+	gap: 3px;
+	padding: 10px 12px;
 	border: 1px solid var(--line);
-	border-radius: 8px;
+	border-radius: 9px;
 	background: var(--bg);
-	color: var(--fg);
 	text-align: left;
 	cursor: pointer;
 }
 .model.active {
 	border-color: var(--accent);
+	background: var(--accent-subtle);
 	box-shadow: inset 0 0 0 1px var(--accent);
 }
 .model-name {
@@ -1109,118 +1493,85 @@ h3 {
 		monospace;
 	color: var(--muted);
 }
-.model-notes {
-	margin-top: 8px;
+.segmented {
+	display: inline-flex;
+	align-self: flex-start;
+	gap: 2px;
+	padding: 3px;
+	background: var(--bg-subtle);
+	border-radius: 9px;
 }
-.inputs {
-	display: grid;
-	grid-template-columns: 1.5fr 1fr;
-	gap: 16px 32px;
-	align-items: start;
+.segmented button {
+	border: 0;
+	padding: 6px 12px;
+	border-radius: 7px;
+	background: none;
+	color: var(--muted);
+	font-size: 13px;
+	font-weight: 500;
+	cursor: pointer;
 }
-@media (max-width: 860px) {
-	.inputs {
-		grid-template-columns: 1fr;
-	}
-}
-.inputs label:not(.field) {
-	display: block;
-}
-.indent {
-	margin: 4px 0 10px 22px;
-}
-select.indent {
-	width: calc(100% - 22px);
-}
-.choice {
-	display: flex;
-	flex-wrap: wrap;
-	gap: 4px 16px;
-	margin-bottom: 6px;
-}
-input.url {
-	font-size: 12px;
-}
-.mt-xs {
-	margin-top: 4px;
-}
-.uploads input[type="file"] {
-	font-size: 12px;
-	max-width: 100%;
-}
-.field {
-	display: block;
-	font-weight: 600;
-	margin-bottom: 6px;
+.segmented button.on {
+	background: var(--bg);
+	color: var(--fg);
+	box-shadow: 0 1px 2px rgb(0 0 0 / 0.12);
 }
 input[type="text"],
 select {
 	width: 100%;
-	padding: 7px 9px;
+	padding: 8px 10px;
 	border: 1px solid var(--line);
-	border-radius: 6px;
+	border-radius: 8px;
 	background: var(--bg);
 	color: var(--fg);
 	font:
-		14px ui-monospace,
+		13px ui-monospace,
 		monospace;
 }
-input:disabled,
-select:disabled {
-	opacity: 0.7;
-}
-.only-reads {
-	margin: 0 0 0.5rem;
-}
-.hint {
-	color: var(--muted);
+input[type="file"] {
 	font-size: 12px;
-	margin-top: 6px;
-}
-.bad,
-.differs {
-	color: var(--error);
-}
-.ok {
-	color: var(--done);
+	max-width: 100%;
 }
 .run-row {
 	display: flex;
 	flex-wrap: wrap;
 	align-items: center;
-	gap: 12px 16px;
-	margin-top: 16px;
+	justify-content: space-between;
+	gap: 12px 20px;
+	margin: 0 -28px -24px;
+	padding: 16px 28px;
+	background: var(--bg-subtle);
+	border-top: 1px solid var(--line);
+	border-radius: 0 0 12px 12px;
+}
+.run-about {
+	display: flex;
+	flex-direction: column;
+	gap: 8px;
+	flex: 1 1 360px;
 }
 button.run {
-	padding: 9px 22px;
+	padding: 11px 24px;
 	border: 0;
-	border-radius: 6px;
+	border-radius: 9px;
 	background: var(--accent);
 	color: #fff;
-	font: 600 14px system-ui;
+	font-weight: 600;
 	cursor: pointer;
 }
 button.run:disabled {
 	opacity: 0.45;
 	cursor: default;
 }
-button.link {
-	border: 0;
-	background: none;
-	color: var(--accent);
-	font-size: 12px;
-	cursor: pointer;
-	white-space: nowrap;
-}
 .steps {
 	display: flex;
 	flex-wrap: wrap;
-	gap: 8px;
+	gap: 6px;
 	align-items: center;
 }
 .step {
 	font:
-		12px ui-monospace,
+		11.5px ui-monospace,
 		monospace;
 	padding: 2px 8px;
 	border-radius: 10px;
@@ -1239,39 +1590,296 @@ button.link {
 	border-color: var(--error);
 	color: var(--error);
 }
-.title-row {
+.summary-bar {
 	display: flex;
-	justify-content: space-between;
+	flex-wrap: wrap;
+	align-items: center;
+	gap: 8px 20px;
+	margin-bottom: 20px;
+	padding: 10px 16px;
+	border: 1px solid var(--line);
+	border-radius: 10px;
+	background: var(--bg);
+	font-size: 13px;
+}
+.push {
+	margin-left: auto;
+}
+
+/* The workspace: a list on the left, the selected call on the right */
+.workspace {
+	display: flex;
+	flex-wrap: wrap;
+	align-items: flex-start;
+	gap: 20px;
+}
+.side {
+	flex: 1 1 340px;
+	max-width: 100%;
+	padding: 16px 10px;
+	display: flex;
+	flex-direction: column;
+	gap: 6px;
+}
+.main {
+	flex: 999 1 620px;
+	min-width: 0;
+	display: flex;
+	flex-direction: column;
+	gap: 16px;
+}
+.side-head {
+	display: flex;
 	align-items: baseline;
-	gap: 12px;
+	justify-content: space-between;
+	gap: 8px;
+	padding: 0 8px 6px;
+}
+.tiles-models {
+	display: grid;
+	grid-template-columns: repeat(3, minmax(0, 1fr));
+	gap: 6px;
+	padding: 4px 8px 0;
+}
+.tile-model {
+	display: flex;
+	flex-direction: column;
+	gap: 6px;
+	padding: 9px 10px;
+	border: 1px solid var(--line);
+	border-radius: 9px;
+	background: var(--bg);
+	text-align: left;
+	cursor: pointer;
+}
+.tile-model:hover {
+	border-color: var(--muted);
+}
+.tile-model.active {
+	border-color: var(--accent);
+	background: var(--accent-subtle);
+	box-shadow: inset 0 0 0 1px var(--accent);
+}
+.tile-top {
+	display: flex;
+	align-items: center;
+	justify-content: space-between;
+}
+.tile-name {
+	font-size: 13px;
+	font-weight: 600;
+}
+.sr {
+	fill: var(--short-reads);
+}
+.lr {
+	fill: var(--long-reads);
+}
+.key {
+	display: inline-block;
+	width: 14px;
+	height: 4px;
+	border-radius: 1px;
+	vertical-align: middle;
+}
+.sr-key {
+	background: var(--short-reads);
+}
+.lr-key {
+	background: var(--long-reads);
+}
+.model-card {
+	margin: 10px 8px 4px;
+	padding: 12px;
+	display: flex;
+	flex-direction: column;
+	gap: 8px;
+	align-items: flex-start;
+	background: var(--bg-subtle);
+	border-radius: 10px;
+}
+.model-card-name {
+	font-weight: 600;
+}
+.facts {
+	display: flex;
+	flex-wrap: wrap;
+	gap: 5px;
+}
+.fact {
+	font-size: 12px;
+	padding: 3px 8px;
+	border-radius: 6px;
+	background: var(--bg);
+	border: 1px solid var(--line);
+}
+.ex-list {
+	display: flex;
+	flex-direction: column;
+	gap: 1px;
+	padding: 4px 0;
+}
+.ex {
+	width: 100%;
+	display: flex;
+	align-items: center;
+	gap: 8px;
+	padding: 7px 10px;
+	border: 0;
+	border-radius: 7px;
+	background: none;
+	text-align: left;
+	cursor: pointer;
+}
+.ex:hover {
+	background: var(--bg-subtle);
+}
+.ex.active {
+	background: var(--accent-subtle);
+	box-shadow: inset 3px 0 0 var(--accent);
+}
+.ex-label {
+	flex: 1;
+	min-width: 0;
+	font-size: 13px;
+}
+.ex-pos {
+	width: 80px;
+	text-align: right;
+	font-size: 11px;
+	color: var(--muted);
+}
+.kind {
+	font-size: 10.5px;
+	font-weight: 600;
+	padding: 2px 6px;
+	border-radius: 4px;
+	white-space: nowrap;
+}
+.kind-missed {
+	background: var(--tag-missed-bg);
+	color: var(--tag-missed);
+}
+.kind-wrong {
+	background: var(--tag-gt-bg);
+	color: var(--tag-gt);
+}
+.kind-extra {
+	background: var(--tag-extra-bg);
+	color: var(--tag-extra);
+}
+.kind-low {
+	background: var(--bg-subtle);
+	color: var(--muted);
+}
+.kind-called {
+	background: var(--tag-ok-bg);
+	color: var(--tag-ok);
+}
+.side-foot {
+	padding: 10px 8px 0;
+	line-height: 1.5;
+}
+
+/* Your VCF's lists */
+.chips {
+	display: flex;
+	flex-wrap: wrap;
+	gap: 6px;
+	padding: 0 8px;
+}
+.chip {
+	padding: 5px 10px;
+	border: 1px solid var(--line);
+	border-radius: 999px;
+	background: var(--bg);
+	font-size: 12px;
+	cursor: pointer;
+}
+.chip.on {
+	background: var(--fg);
+	border-color: var(--fg);
+	color: var(--bg);
+}
+.chip .count {
+	opacity: 0.7;
+}
+.side > .hint,
+.side > .bad {
+	padding: 0 8px;
+}
+.filter {
+	margin: 4px 8px;
+	width: calc(100% - 16px) !important;
+}
+.list {
+	max-height: 520px;
+	overflow: auto;
+	display: flex;
+	flex-direction: column;
+}
+.call-row {
+	display: grid;
+	grid-template-columns: 1.3fr 1fr 34px 30px;
+	gap: 8px;
+	align-items: center;
+	padding: 7px 8px;
+	border: 0;
+	border-bottom: 1px solid var(--line);
+	background: none;
+	font-size: 12px;
+	text-align: left;
+	cursor: pointer;
+}
+.call-row:hover {
+	background: var(--bg-subtle);
+}
+.call-row.active {
+	background: var(--accent-subtle);
+}
+.call-row .allele {
+	overflow: hidden;
+	text-overflow: ellipsis;
+	white-space: nowrap;
+	color: var(--muted);
+}
+.call-row .num {
+	text-align: right;
+}
+.low {
+	color: var(--warning);
+	font-weight: 600;
+}
+.vcf-summary {
+	padding: 8px;
+	font-size: 13px;
+}
+.vcf-summary summary {
+	cursor: pointer;
+	font-weight: 500;
 }
 .tiles {
 	display: grid;
-	grid-template-columns: repeat(auto-fill, minmax(112px, 1fr));
+	grid-template-columns: repeat(3, minmax(0, 1fr));
 	gap: 8px;
+	margin: 10px 0;
 }
 .tile {
 	display: flex;
 	flex-direction: column;
-	padding: 8px 10px;
-	border: 1px solid var(--line);
-	border-radius: 8px;
+	font-size: 11px;
 	color: var(--muted);
-	font-size: 12px;
 }
 .tile b {
 	color: var(--fg);
-	font-size: 18px;
+	font-size: 16px;
 	font-variant-numeric: tabular-nums;
-}
-.gq {
-	margin-top: 12px;
 }
 .bars {
 	display: flex;
 	align-items: flex-end;
-	gap: 4px;
-	height: 80px;
+	gap: 3px;
+	height: 60px;
 	margin-top: 4px;
 }
 .bar-col {
@@ -1281,54 +1889,211 @@ button.link {
 	flex-direction: column;
 	justify-content: flex-end;
 	align-items: center;
-	font-size: 10px;
+	font-size: 9px;
 	color: var(--muted);
 }
 .bar {
 	width: 100%;
 	min-height: 1px;
 	background: var(--accent);
-	border-radius: 3px 3px 0 0;
+	border-radius: 2px 2px 0 0;
 }
 .bar.low {
 	background: var(--warning);
 }
+
+/* The example and the selected call */
+.head-row {
+	display: flex;
+	flex-wrap: wrap;
+	align-items: flex-start;
+	justify-content: space-between;
+	gap: 12px;
+	margin-bottom: 16px;
+}
+.sub {
+	font-size: 13px;
+	color: var(--muted);
+}
+.call-title {
+	font-size: 18px;
+	margin-top: 2px;
+}
+.compare,
+.stats {
+	display: grid;
+	grid-template-columns: repeat(auto-fit, minmax(170px, 1fr));
+	gap: 1px;
+	background: var(--line);
+	border: 1px solid var(--line);
+	border-radius: 10px;
+	overflow: hidden;
+}
+.compare > div,
+.stats > div {
+	display: flex;
+	flex-direction: column;
+	gap: 4px;
+	padding: 12px 14px;
+	background: var(--bg);
+}
+.compare b {
+	font-size: 13px;
+	line-height: 1.4;
+}
+.compare .official {
+	background: var(--accent-subtle);
+}
+.stats b {
+	font-size: 17px;
+}
+.note {
+	display: flex;
+	flex-wrap: wrap;
+	align-items: center;
+	gap: 4px 16px;
+	margin-top: 12px;
+	padding: 10px 14px;
+	background: var(--bg-subtle);
+	border-radius: 8px;
+	font-size: 13px;
+}
+.note p {
+	flex: 1 1 320px;
+}
+.card > .steps,
+.card > .bad {
+	margin-top: 14px;
+}
+.detail {
+	display: grid;
+	grid-template-columns: minmax(220px, 1fr) 1.4fr;
+	gap: 16px 28px;
+	margin-top: 18px;
+}
+@media (max-width: 760px) {
+	.detail {
+		grid-template-columns: 1fr;
+	}
+}
+.how {
+	margin: 0 0 12px;
+	padding-left: 18px;
+	display: flex;
+	flex-direction: column;
+	gap: 6px;
+	font-size: 13px;
+}
+.probs {
+	display: grid;
+	gap: 5px;
+	margin-bottom: 6px;
+}
+.prob {
+	display: grid;
+	grid-template-columns: 36px 1fr 56px;
+	align-items: center;
+	gap: 8px;
+	font:
+		12px ui-monospace,
+		monospace;
+}
+.prob-bar {
+	height: 10px;
+	background: var(--bg-subtle);
+	border-radius: 5px;
+	overflow: hidden;
+}
+.prob-bar div {
+	height: 100%;
+	background: var(--accent);
+}
+.prob .p {
+	text-align: right;
+	color: var(--muted);
+}
+
+/* Tabs: what DeepVariant looked at */
+.tabs-card {
+	padding: 0;
+	overflow: hidden;
+}
 .tabs {
 	display: flex;
 	flex-wrap: wrap;
-	gap: 6px;
-	align-items: center;
+	gap: 0 22px;
+	padding: 0 22px;
+	border-bottom: 1px solid var(--line);
 }
 .tabs button {
-	padding: 4px 10px;
-	border: 1px solid var(--line);
-	border-radius: 14px;
-	background: var(--bg);
-	color: var(--fg);
-	font-size: 12px;
+	padding: 12px 2px;
+	margin-bottom: -1px;
+	border: 0;
+	border-bottom: 2px solid transparent;
+	background: none;
+	color: var(--muted);
+	font-size: 14px;
+	font-weight: 500;
 	cursor: pointer;
 }
-.tabs button.active {
-	border-color: var(--accent);
-	color: var(--accent);
+.tabs button.on {
+	color: var(--fg);
+	border-bottom-color: var(--accent);
 }
-.count {
+.tabs .count {
 	color: var(--muted);
+	font-weight: 400;
 }
-.tabs .filter {
-	width: 200px;
-	margin-left: auto;
-	padding: 4px 8px;
+.panel {
+	padding: 16px 22px 20px;
+	display: flex;
+	flex-direction: column;
+	gap: 10px;
+}
+.panel[hidden] {
+	display: none;
+}
+.igv {
+	border: 1px solid var(--line);
+	border-radius: 8px;
+	min-height: 200px;
+	background: #fff;
+}
+.channels {
+	columns: 3 180px;
 	font-size: 12px;
+	color: var(--muted);
+	margin: 0;
+	padding-left: 20px;
+}
+.channels b {
+	color: var(--fg);
+	font-weight: 500;
+}
+figure {
+	margin: 0;
+}
+figure img {
+	display: block;
+	width: 100%;
+	max-width: 1547px;
+	image-rendering: pixelated;
+	border: 1px solid var(--line);
+	border-radius: 4px;
+	background: #000;
+}
+figcaption {
+	font:
+		12px ui-monospace,
+		monospace;
+	color: var(--muted);
+	margin-top: 4px;
 }
 .tablewrap {
 	overflow: auto;
-	max-height: 320px;
+	max-height: 420px;
 	border: 1px solid var(--line);
-	border-radius: 6px;
-}
-.tablewrap.short {
-	max-height: 260px;
+	border-radius: 8px;
 }
 table {
 	border-collapse: collapse;
@@ -1339,7 +2104,7 @@ table {
 }
 th,
 td {
-	padding: 5px 10px;
+	padding: 6px 10px;
 	text-align: left;
 	white-space: nowrap;
 	border-bottom: 1px solid var(--line);
@@ -1367,92 +2132,16 @@ tr.active td {
 tr.filtered td {
 	color: var(--muted);
 }
-.detail {
-	display: grid;
-	grid-template-columns: minmax(220px, 1fr) 2fr;
-	gap: 16px 28px;
-}
-@media (max-width: 760px) {
-	.detail {
-		grid-template-columns: 1fr;
-	}
-}
-.detail p {
-	margin: 0 0 8px;
-}
-.probs {
-	display: grid;
-	gap: 4px;
-}
-.prob {
-	display: grid;
-	grid-template-columns: 36px 1fr 56px;
-	align-items: center;
-	gap: 8px;
-	font:
-		12px ui-monospace,
-		monospace;
-}
-.prob-bar {
-	height: 10px;
-	background: var(--bg-subtle);
-	border-radius: 5px;
-	overflow: hidden;
-}
-.prob-bar div {
-	height: 100%;
-	background: var(--accent);
-}
-.prob .p {
-	text-align: right;
-	color: var(--muted);
-}
-.igv {
-	border: 1px solid var(--line);
-	border-radius: 6px;
-	min-height: 200px;
-	background: #fff;
-}
-.channels {
-	columns: 2 280px;
-	font-size: 12px;
-	color: var(--muted);
-	margin: 0 0 10px;
-	padding-left: 20px;
-}
-.channels b {
-	color: var(--fg);
-	font-weight: 600;
-}
-figure {
-	margin: 0 0 12px;
-}
-figure img {
-	display: block;
-	width: 100%;
-	max-width: 1547px;
-	image-rendering: pixelated;
-	border: 1px solid var(--line);
-	border-radius: 4px;
-	background: #000;
-}
-figcaption {
-	font:
-		12px ui-monospace,
-		monospace;
-	color: var(--muted);
-	margin-top: 4px;
-}
 pre {
-	max-height: 300px;
+	max-height: 360px;
 	overflow: auto;
 	font-size: 12px;
 	background: var(--bg-subtle);
-	padding: 8px;
-	margin: 10px 0 0;
+	padding: 10px;
+	margin: 0;
+	border-radius: 8px;
 }
-summary {
-	cursor: pointer;
-	font-weight: 600;
+code {
+	font-size: 0.92em;
 }
 </style>
