@@ -507,7 +507,7 @@ const pct = (a, b) => (b ? `${((100 * a) / b).toFixed(1)}%` : "–");
 
 	<!-- 1. Model, 2. data, 3. position -->
 	<section class="card-dvi" id="dvi-setup">
-		<h2><span class="num">1</span> Model: what <code>--model_type</code> did you run?</h2>
+		<h2><span class="step-num">1</span> Model: what <code>--model_type</code> did you run?</h2>
 		<div class="models" role="radiogroup" aria-label="Model">
 			{#each MODELS as m (m.key)}
 				<button
@@ -532,7 +532,7 @@ const pct = (a, b) => (b ? `${((100 * a) / b).toFixed(1)}%` : "–");
 			<a href={model.caseStudy}>Case study</a>
 		</p>
 
-		<h2 class="mt"><span class="num">2</span> Data</h2>
+		<h2 class="mt"><span class="step-num">2</span> Data</h2>
 		<div class="inputs">
 			<div>
 				<label
@@ -631,7 +631,7 @@ const pct = (a, b) => (b ? `${((100 * a) / b).toFixed(1)}%` : "–");
 				</select>
 				<div class="hint">Contig names must match your BAM (chr1, not 1). Only the region's sequence is downloaded.</div>
 
-				<label class="field mt" for="dvi-region"><span class="num">3</span> Position</label>
+				<label class="field mt" for="dvi-region"><span class="step-num">3</span> Position</label>
 				<input id="dvi-region" type="text" bind:value={regionText} disabled={source === "example"} />
 				<div class="hint" class:bad={region.error}>
 					{#if region.error}{region.error}
@@ -926,7 +926,7 @@ h3 {
 	color: var(--muted);
 	margin: 0 0 20px;
 }
-.num {
+.step-num {
 	display: inline-grid;
 	place-items: center;
 	width: 18px;
