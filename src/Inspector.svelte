@@ -31,7 +31,6 @@ const REFERENCES = {
 	hg19: { name: "GRCh37 / hg19", fasta: `${URL_IGV}/hg19/hg19.fasta`, fai: `${URL_IGV}/hg19/hg19.fasta.fai` }
 };
 const EXAMPLE_REFERENCE = "hg38"; // all examples are HG003 on GRCh38
-const PILEUP_HALF_WIDTH = 110; // what IGV shows around a call: about the width of a short-read pileup image
 const MAX_REGION = 200000; // bp: larger regions would take minutes in the browser
 // Whole-genome BAMs from DeepVariant's case studies, to try reads by URL: 42basepairs serves DeepVariant's
 // bucket with range requests and CORS (the bucket itself has no CORS)
@@ -59,7 +58,7 @@ let modelKey = $state("wgs");
 // switches with pickSource, below.
 let { source = $bindable("example") } = $props();
 let exampleIndex = $state(0);
-let readsFrom = $state("file"); // "file" | "url"
+let readsFrom = $state("url"); // "url" | "file"
 let files = $state([]); // the reads, from your computer
 let readsUrl = $state(""); // or from a URL
 let indexUrl = $state(""); // its index ("" = the BAM's URL + .bai)
@@ -116,6 +115,31 @@ const reference = $derived(REFERENCES[source === "example" ? EXAMPLE_REFERENCE :
 const reads = $derived(readsFrom === "url" ? pickUrl(readsUrl, indexUrl) : pickBam(files, "reads"));
 const pangenomeReads = $derived(pickBam(pangenomeFiles, "pangenome"));
 const capture = $derived(parseBed(captureText));
+// The model, guessed from the reads' file name (HG003.novaseq..., HG003_R104_sup..., *.pacbio.*): sets the
+// model when the reads change; pick another and it stays
+const MODEL_WORDS = [
+	["wes", ["wes", "exome", "wxs"]],
+	["hybrid_pacbio_illumina", ["hybrid"]],
+	["pacbio", ["pacbio", "hifi", "ccs", "sprq", "revio", "sequel"]],
+	["ont_r104", ["ont", "nanopore", "r104", "r10", "promethion", "minion", "dorado"]],
+	["wgs", ["wgs", "illumina", "novaseq", "hiseq", "nextseq"]]
+];
+function guessModel(name) {
+	const words = name.toLowerCase().split(/[^a-z0-9]+/);
+	for (const [key, list] of MODEL_WORDS) {
+		const word = list.find((w) => words.includes(w));
+		if (word) return { key, word };
+	}
+	return null;
+}
+let modelGuess = $state(null);
+$effect(() => {
+	const name = reads.url ? reads.url.split("/").pop().split("?")[0] : reads.alignments?.name;
+	const guess = name ? guessModel(name) : null;
+	modelGuess = guess;
+	if (guess && source === "upload") modelKey = guess.key;
+});
+
 // No position given: one where your reads are (and, with your VCF, a call worth a look)
 const autoPosition = $derived.by(() => {
 	if (source !== "upload" || !readsSpan?.chrom) return null;
@@ -475,8 +499,6 @@ async function select(call) {
 	pileupIndex = 0;
 	pileupError = "";
 	showBases(call);
-	const halfWidth = run.model.realigns ? PILEUP_HALF_WIDTH : 600; // long reads: a wider view
-	const locus = `${call.chrom}:${call.pos - halfWidth}-${call.pos + halfWidth}`;
 	const realigned = run.model.realigns ? windowFor(call) : null;
 	readsInfo = realigned
 		? {
@@ -490,7 +512,9 @@ async function select(call) {
 			? { kind: "phased", url: URL.createObjectURL(run.phased) }
 			: null;
 	await tick(); // IGV's container is rendered once something is selected
-	await showInIgv(locus, realigned);
+	// As many bases as fit at ~12 px each, so IGV can draw them as letters
+	const halfWidth = Math.max(15, Math.floor((divIgv?.clientWidth || 900) / 24));
+	await showInIgv(`${call.chrom}:${call.pos - halfWidth}-${call.pos + halfWidth}`, realigned);
 	if (call.MID !== "small_model") {
 		try {
 			// show_examples names images by the 0-based start (POS - 1)
@@ -506,8 +530,8 @@ async function select(call) {
 // DeepVariant used: the reads after its local realignment (short reads), the reads with its own phasing,
 // grouped by haplotype (long reads), and the pangenome's haplotypes (pangenome-aware)
 const NAME_REALIGNED = "Realigned by DeepVariant (what it saw)";
-// Compact read tracks, so the whole view fits on a screen: short rows and a thin coverage track (scroll for more)
-const IGV_READS = { height: 150, coverageTrackHeight: 24, alignmentRowHeight: 8, squishedRowHeight: 3 };
+// Read tracks with every base as a letter (IGV draws letters at 10+ px per base, in rows 10+ px tall)
+const IGV_READS = { height: 230, coverageTrackHeight: 24, alignmentRowHeight: 11, showAllBases: true };
 async function showInIgv(locus, realigned) {
 	const realignedTrack = realigned && {
 		name: NAME_REALIGNED,
@@ -806,46 +830,22 @@ const fileName = (r) => (r.url ? r.url.split("/").pop().split("?")[0] : r.alignm
 
 				<div class="field-row">
 					<div class="field-label">
-						<h2><span class="step-num">1</span> Model</h2>
-						<p class="hint">The <code>--model_type</code> you ran</p>
-					</div>
-					<div class="field-body">
-						<div class="models" role="radiogroup" aria-label="Model">
-							{#each MODELS as m (m.key)}
-								<button
-									class="model"
-									class:active={m.key === modelKey}
-									role="radio"
-									aria-checked={m.key === modelKey}
-									onclick={() => pickModel(m.key)}
-								>
-									<span class="model-name">{m.name}</span>
-									<span class="model-type">{m.modelType}</span>
-								</button>
-							{/each}
-						</div>
-						<p class="hint">{model.about} <a href={model.caseStudy}>Case study</a></p>
-					</div>
-				</div>
-
-				<div class="field-row">
-					<div class="field-label">
-						<h2><span class="step-num">2</span> Reads</h2>
+						<h2><span class="step-num">1</span> Reads</h2>
 						<p class="hint">A BAM with its index (or a small BAM or SAM without one). The only required input.</p>
 					</div>
 					<div class="field-body">
 						<div class="segmented" role="radiogroup" aria-label="Reads from">
 							<button
 								role="radio"
-								aria-checked={readsFrom === "file"}
-								class:on={readsFrom === "file"}
-								onclick={() => (readsFrom = "file")}>From your computer</button
-							>
-							<button
-								role="radio"
 								aria-checked={readsFrom === "url"}
 								class:on={readsFrom === "url"}
 								onclick={() => (readsFrom = "url")}>From a URL</button
+							>
+							<button
+								role="radio"
+								aria-checked={readsFrom === "file"}
+								class:on={readsFrom === "file"}
+								onclick={() => (readsFrom = "file")}>From your computer</button
 							>
 						</div>
 						{#if readsFrom === "file"}
@@ -915,6 +915,36 @@ const fileName = (r) => (r.url ? r.url.split("/").pop().split("?")[0] : r.alignm
 									<a href="{URL_DEEPVARIANT}/tools/gbz_haplotypes_bam.py" download>this script</a>.{/if}
 							</div>
 						{/if}
+					</div>
+				</div>
+
+				<div class="field-row">
+					<div class="field-label">
+						<h2><span class="step-num">2</span> Model</h2>
+						<p class="hint">The <code>--model_type</code> you ran</p>
+					</div>
+					<div class="field-body">
+						<div class="models" role="radiogroup" aria-label="Model">
+							{#each MODELS as m (m.key)}
+								<button
+									class="model"
+									class:active={m.key === modelKey}
+									role="radio"
+									aria-checked={m.key === modelKey}
+									onclick={() => pickModel(m.key)}
+								>
+									<span class="model-name">{m.name}</span>
+									<span class="model-type">{m.modelType}</span>
+								</button>
+							{/each}
+						</div>
+						{#if modelGuess?.key === modelKey}
+							<p class="hint">
+								<span class="ok">✓</span> Guessed from the file name (<span class="mono">{modelGuess.word}</span>): pick another
+								if that's wrong.
+							</p>
+						{/if}
+						<p class="hint">{model.about} <a href={model.caseStudy}>Case study</a></p>
 					</div>
 				</div>
 

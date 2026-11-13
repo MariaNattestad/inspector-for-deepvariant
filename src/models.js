@@ -50,7 +50,7 @@ export const MODELS = [
 				kind: "missed",
 				truth: "T>TATC, 0/1",
 				official: "no-call (./., GQ 7)",
-				note: "Realignment gives the insertion to reads that, as aligned, show it as mismatches. Pangenome-aware DeepVariant calls it."
+				note: "In some reads, the aligner wrote the insertion as a few mismatched bases instead. DeepVariant's realignment turns them back into the insertion (compare the two read tracks), yet it still calls no genotype. Pangenome-aware DeepVariant calls it."
 			},
 			{
 				pos: 35438863,
