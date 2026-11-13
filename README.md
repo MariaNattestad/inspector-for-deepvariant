@@ -15,6 +15,22 @@ and compares each rerun call with yours. Your files stay on your computer: nothi
 
 This is an independent tool, not made by or affiliated with the DeepVariant team at Google.
 
+## Your data
+
+Reads can be a local BAM of any size (with its index): it's read from disk on demand, so only the locus is read.
+Or a URL, read with HTTP range requests, so only the locus is downloaded. The server has to allow requests from
+other sites (CORS); for a bucket, a rule like this:
+
+```bash
+# Google Cloud Storage
+echo '[{"origin": ["*"], "method": ["GET", "HEAD"], "responseHeader": ["Content-Length", "Content-Range", "Accept-Ranges"], "maxAgeSeconds": 3600}]' > cors.json
+gcloud storage buckets update gs://BUCKET --cors-file=cors.json
+```
+
+On AWS S3, the same as a bucket CORS configuration (AllowedMethods GET and HEAD, AllowedOrigins `*`,
+ExposeHeaders Content-Length, Content-Range, Accept-Ranges). Links to a locus include the reads' URL, so a locus
+of data on such a server can be shared.
+
 ## Run it locally
 
 ```bash

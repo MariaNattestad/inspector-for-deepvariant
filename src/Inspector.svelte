@@ -27,7 +27,10 @@ const MAX_REGION = 200000; // bp: larger regions would take minutes in the brows
 let modelKey = $state("wgs");
 let source = $state("example"); // "example" | "upload"
 let exampleIndex = $state(0);
-let files = $state([]); // the reads
+let readsFrom = $state("file"); // "file" | "url"
+let files = $state([]); // the reads, from your computer
+let readsUrl = $state(""); // or from a URL
+let indexUrl = $state(""); // its index ("" = the BAM's URL + .bai)
 let pangenomeFiles = $state([]);
 let captureText = $state(""); // WES capture BED, to run on whole capture intervals
 let referenceKey = $state("hg38");
@@ -70,7 +73,7 @@ const model = $derived(modelByKey(modelKey));
 const examples = $derived(model.examples);
 const example = $derived(examples[Math.min(exampleIndex, examples.length - 1)]);
 const reference = $derived(REFERENCES[source === "example" ? EXAMPLE_REFERENCE : referenceKey]);
-const reads = $derived(pickBam(files, "reads"));
+const reads = $derived(readsFrom === "url" ? pickUrl(readsUrl, indexUrl) : pickBam(files, "reads"));
 const pangenomeReads = $derived(pickBam(pangenomeFiles, "pangenome"));
 const capture = $derived(parseBed(captureText));
 const region = $derived(regionToRun(regionText, model, source === "upload" ? capture : []));
@@ -120,12 +123,32 @@ function parseBed(text) {
 		.map(([chrom, s, e]) => ({ chrom, start: Number(s) + 1, end: Number(e) }));
 }
 
-// A BAM with its index can be used as is; anything else (SAM, unsorted, no index) is sorted and indexed first
+// A BAM with its index can be used as is, at any size: DeepVariant and IGV only read the locus. A small file
+// without an index (SAM, unsorted) is sorted and indexed first, in the browser; a large one needs its index.
+const MAX_UNINDEXED = 200e6; // bytes
 function pickBam(list, what) {
 	const alignments = list.find((f) => /\.(bam|sam)$/i.test(f.name));
 	const index = list.find((f) => /\.(bai|csi)$/i.test(f.name));
 	if (!alignments) return { error: `Pick the ${what} as a .bam or .sam file (and its .bai, if you have one).` };
-	return { alignments, index: alignments.name.toLowerCase().endsWith(".bam") ? index : undefined };
+	const bam = alignments.name.toLowerCase().endsWith(".bam");
+	if (!(bam && index) && alignments.size > MAX_UNINDEXED)
+		return {
+			error: `${alignments.name} is ${(alignments.size / 1e9).toFixed(1)} GB: select its index too (.bai or .csi, from samtools index), so only the locus is read.`
+		};
+	return { alignments, index: bam ? index : undefined };
+}
+
+// A BAM at a URL, read with range requests; its index at indexUrl, or by default the BAM's URL + .bai (before
+// any query string, as in a signed URL)
+function pickUrl(url, indexUrl) {
+	let parsed;
+	try {
+		parsed = new URL(url.trim());
+	} catch {
+		return { error: "Enter the BAM's URL (https://…/sample.bam)." };
+	}
+	const index = indexUrl.trim() || `${parsed.origin}${parsed.pathname}.bai${parsed.search}`;
+	return { url: parsed.href, index };
 }
 
 // samtools (biowasm), in its own worker: sort + index an upload so DeepVariant and IGV can jump to the region
@@ -212,7 +235,8 @@ async function runDeepVariant() {
 		let input, pangenome;
 		if (source === "upload") {
 			busy = "Sorting and indexing your reads with samtools…";
-			input = reads.index ? { bam: reads.alignments, index: reads.index } : await sortAndIndex(reads.alignments);
+			if (reads.url) input = { bam: reads.url, index: reads.index };
+			else input = reads.index ? { bam: reads.alignments, index: reads.index } : await sortAndIndex(reads.alignments);
 			if (model.pangenome) pangenome = { bam: pangenomeReads.alignments, index: pangenomeReads.index };
 		} else {
 			busy = "Downloading the example reads…";
@@ -417,12 +441,20 @@ function genotypeProbabilities(call) {
 }
 
 // ---------------------------------------------------------------------------------------------------------
-// Links: the model, example or region are in the URL, so a locus can be shared (your files stay with you)
+// Links: the model, example or region are in the URL, so a locus can be shared (your files stay with you, but
+// reads from a URL are part of the link)
 // ---------------------------------------------------------------------------------------------------------
 function updateUrl() {
 	const params = new URLSearchParams({ model: model.key });
 	if (source === "example") params.set("example", String(exampleIndex + 1));
-	else params.set("region", regionText.replace(/\s/g, ""));
+	else {
+		params.set("region", regionText.replace(/\s/g, ""));
+		if (readsFrom === "url" && reads.url) {
+			params.set("reads", reads.url);
+			if (indexUrl.trim()) params.set("index", indexUrl.trim());
+			if (referenceKey !== "hg38") params.set("reference", referenceKey);
+		}
+	}
 	history.replaceState(history.state, "", `${location.pathname}?${params}`);
 }
 async function copyLink() {
@@ -452,6 +484,12 @@ onMount(() => {
 	if (params.get("region")) {
 		source = "upload";
 		regionText = params.get("region");
+		if (params.get("reads")) {
+			readsFrom = "url";
+			readsUrl = params.get("reads");
+			indexUrl = params.get("index") ?? "";
+		}
+		if (REFERENCES[params.get("reference")]) referenceKey = params.get("reference");
 	} else pickExample(Math.max(0, Math.min(model.examples.length - 1, Number(params.get("example") ?? 1) - 1)));
 
 	worker = new Worker(`${URL_DEEPVARIANT}/worker.mjs`, { type: "module" });
@@ -555,21 +593,42 @@ const pct = (a, b) => (b ? `${((100 * a) / b).toFixed(1)}%` : "–");
 				>
 				{#if source === "upload"}
 					<div class="indent uploads">
-						<label class="field" for="dvi-reads">Reads <span class="hint">(.bam + .bai, or any .bam/.sam)</span></label>
-						<input
-							id="dvi-reads"
-							type="file"
-							multiple
-							accept=".bam,.sam,.bai,.csi"
-							onchange={(e) => (files = [...e.target.files])}
-						/>
-						<div class="hint" class:bad={files.length && reads.error}>
-							{#if files.length && reads.error}{reads.error}
-							{:else if reads.index}{reads.alignments.name} + {reads.index.name}
-							{:else if files.length}{reads.alignments.name}: will be sorted and indexed in your browser (samtools)
-							{:else}The BAM you gave DeepVariant, with its .bai (it's read on demand, so a whole genome is fine), or a snippet
-								made with <code>samtools view -b</code> so the header is complete.{/if}
+						<span class="field">Reads</span>
+						<div class="choice">
+							<label><input type="radio" name="dvi-reads-from" value="file" bind:group={readsFrom} /> From your computer</label>
+							<label><input type="radio" name="dvi-reads-from" value="url" bind:group={readsFrom} /> From a URL</label>
 						</div>
+						{#if readsFrom === "file"}
+							<input
+								id="dvi-reads"
+								type="file"
+								multiple
+								accept=".bam,.sam,.bai,.csi"
+								aria-label="Reads (.bam and .bai)"
+								onchange={(e) => (files = [...e.target.files])}
+							/>
+							<div class="hint" class:bad={files.length && reads.error}>
+								{#if files.length && reads.error}{reads.error}
+								{:else if reads.index}{reads.alignments.name} + {reads.index.name}: only the locus is read from disk
+								{:else if files.length}{reads.alignments.name}: will be sorted and indexed in your browser (samtools)
+								{:else}The BAM you gave DeepVariant and its .bai: any size, since only the locus is read. Or a snippet made with
+									<code>samtools view -b</code> (keeps the full header); small files don't need an index.{/if}
+							</div>
+						{:else}
+							<input type="text" class="url" placeholder="https://…/sample.bam" aria-label="BAM URL" bind:value={readsUrl} />
+							<input
+								type="text"
+								class="url mt-xs"
+								placeholder="Index URL (default: the BAM's URL + .bai)"
+								aria-label="Index URL"
+								bind:value={indexUrl}
+							/>
+							<div class="hint" class:bad={readsUrl && reads.error}>
+								{#if readsUrl && reads.error}{reads.error}
+								{:else}Read with range requests, so only the locus is downloaded, whatever the BAM's size. The server must allow
+									range requests and requests from other sites (CORS): S3 and GCS buckets need a CORS rule allowing GET and HEAD.{/if}
+							</div>
+						{/if}
 						{#if model.pangenome}
 							<label class="field mt-s" for="dvi-pangenome">Pangenome haplotypes <span class="hint">(.bam + .bai)</span></label>
 							<input
@@ -650,7 +709,7 @@ const pct = (a, b) => (b ? `${((100 * a) / b).toFixed(1)}%` : "–");
 				{#if busy}<span class="hint">{busy}</span>{/if}
 			</div>
 		</div>
-		{#if error}<div class="bad">Failed: {error}</div>{/if}
+		{#if error}<div class="bad">Failed: {error.replace(/^Error: /, "")}</div>{/if}
 	</section>
 
 	<!-- Your VCF -->
@@ -997,6 +1056,18 @@ h3 {
 }
 select.indent {
 	width: calc(100% - 22px);
+}
+.choice {
+	display: flex;
+	flex-wrap: wrap;
+	gap: 4px 16px;
+	margin-bottom: 6px;
+}
+input.url {
+	font-size: 12px;
+}
+.mt-xs {
+	margin-top: 4px;
 }
 .uploads input[type="file"] {
 	font-size: 12px;

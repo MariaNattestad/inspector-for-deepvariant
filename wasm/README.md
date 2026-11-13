@@ -54,9 +54,11 @@ hg38) from igv.js's bucket on S3.
 
 ### Range requests
 
-The reference is read with HTTP range requests (Pyodide's `FS.createLazyFile`, 1 MB at a time), so a
-locus downloads a few MB of it, not 3 GB; reads and pangenomes are `File`s from the page, read from disk on
-demand (Emscripten's WORKERFS). Pyodide only uses ranges if a HEAD response shows `Accept-Ranges: bytes`,
+The reference, and reads given as a URL, are read with HTTP range requests (Pyodide's `FS.createLazyFile`, 1 MB
+at a time; the BAM's index is downloaded whole), so a locus downloads a few MB, not the 3 GB reference or a
+100 GB BAM. Reads and pangenomes from the user's computer are `File`s, read from disk on demand (Emscripten's
+WORKERFS), so a local BAM of any size works too, as long as its index comes with it. (Biowasm's Aioli mounts URLs
+the same way, with `createLazyFile`.) Pyodide only uses ranges if a HEAD response shows `Accept-Ranges: bytes`,
 which isn't always visible even when ranges work: cross-origin, the browser hides it unless the server lists
 it in `Access-Control-Expose-Headers`, and Vite's dev server leaves it out of HEAD responses. So the worker
 tests ranges itself (a 2-byte range request must return 206; not `bytes=0-0`, which Vite answers with the

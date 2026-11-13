@@ -3,10 +3,12 @@
 //
 // Lives in public/deepvariant/<version>/ next to everything it loads (see wasm/build.sh).
 //
-// To the worker:   {cmd: "run", region: "chr:start-end", bam: File, index: File, reference: {fasta: URL, fai: URL},
-//                   verbose?: bool, realigned?: bool, model?: "wgs" | "wes" | "pacbio" | ...,
-//                   pangenome?: File, pangenomeIndex?: File}
-//                  (reference: read on demand with range requests; realigned: also return the reads DeepVariant used: after local realignment for short-read
+// To the worker:   {cmd: "run", region: "chr:start-end", bam: File | URL, index: File | URL,
+//                   reference: {fasta: URL, fai: URL}, verbose?: bool, realigned?: bool,
+//                   model?: "wgs" | "wes" | "pacbio" | ..., pangenome?: File, pangenomeIndex?: File}
+//                  (bam: a local file, read from disk on demand, or a URL, read with range requests (the server
+//                   must allow both: CORS and Accept-Ranges), so only the locus is read, whatever the BAM's size;
+//                   reference: read on demand with range requests; realigned: also return the reads DeepVariant used: after local realignment for short-read
 //                   models, with its own phasing (HP tag) for long-read ones, which don't realign;
 //                   model: see MODELS, default "wgs"; pangenome: a BAM of pangenome haplotypes, for "wgs_pangenome")
 //                  {cmd: "show_examples", verbose?: bool}   (after a run)
@@ -156,12 +158,28 @@ XMLHttpRequest.prototype.getResponseHeader = function (name) {
 	return value == null && /^accept-ranges$/i.test(name) && rangeOk.has(this.responseURL) ? "bytes" : value;
 };
 
+// Fetches url, explaining the usual reason a fetch fails outright: the server doesn't allow other sites
+async function fetchOrExplain(url, options) {
+	try {
+		const response = await fetch(url, options);
+		if (!response.ok) throw new Error(`${url}: HTTP ${response.status}`);
+		return response;
+	} catch (e) {
+		if (e instanceof TypeError)
+			throw new Error(
+				`Couldn't read ${url}. The server must allow requests from other sites (CORS), e.g. for a bucket: allow GET and HEAD from any origin, and expose Content-Length, Content-Range and Accept-Ranges.`
+			);
+		throw e;
+	}
+}
+
 // Creates a file in Pyodide's filesystem whose contents are fetched on demand from url (1 MB at a time)
 async function addLazyFile(py, dst, url) {
 	const parts = dst.split("/"),
 		name = parts.pop();
 	// Size from HEAD (Content-Length is always visible; Content-Range isn't, cross-origin)
-	const size = Number((await fetch(url, { method: "HEAD" })).headers.get("Content-Length"));
+	const size = Number((await fetchOrExplain(url, { method: "HEAD" })).headers.get("Content-Length"));
+	if (!size) throw new Error(`Couldn't get the size of ${url} (no Content-Length).`);
 	// 2 bytes, not "bytes=0-0": Vite's dev server answers that with the whole file
 	const probe = await fetch(url, { headers: { Range: "bytes=0-1" } });
 	await probe.arrayBuffer();
@@ -176,17 +194,31 @@ async function addLazyFile(py, dst, url) {
 	lazyFiles[dst] = { url, size };
 }
 
-// A BAM and its index from the page, read straight from the File objects (nothing is copied). htslib finds the
-// index next to the BAM: <name>.bai or <name>.csi. Returns the BAM's path.
-function mountBam(py, dir, bam, index) {
-	py.FS.mkdir(dir);
-	const ext = index.name.endsWith(".csi") ? ".csi" : ".bai";
-	const blobs = [
-		{ name: bam.name, data: bam },
-		{ name: bam.name + ext, data: index }
-	];
-	py.FS.mount(py.FS.filesystems.WORKERFS, { blobs }, dir);
-	return `${dir}/${bam.name}`;
+// A BAM and its index from the page; htslib finds the index next to the BAM (<name>.bai or <name>.csi).
+// Files are read straight from disk (WORKERFS: nothing is copied); a URL is read with range requests, and its
+// index downloaded (written after the BAM, so htslib doesn't warn that the index is older). Either way only
+// what the locus needs is read. Returns the BAM's path.
+const remoteBams = {}; // BAM URL -> path in Pyodide's filesystem
+async function useBam(py, dir, bam, index) {
+	if (typeof bam !== "string") {
+		py.FS.mkdir(dir);
+		const ext = index.name.endsWith(".csi") ? ".csi" : ".bai";
+		const blobs = [
+			{ name: bam.name, data: bam },
+			{ name: bam.name + ext, data: index }
+		];
+		py.FS.mount(py.FS.filesystems.WORKERFS, { blobs }, dir);
+		return `${dir}/${bam.name}`;
+	}
+	if (!remoteBams[bam]) {
+		const name = new URL(bam).pathname.split("/").pop() || "reads.bam";
+		const path = `/remote/${Object.keys(remoteBams).length}/${name}`;
+		await addLazyFile(py, path, bam);
+		const ext = new URL(index).pathname.endsWith(".csi") ? ".csi" : ".bai";
+		py.FS.writeFile(path + ext, new Uint8Array(await (await fetchOrExplain(index)).arrayBuffer()));
+		remoteBams[bam] = path;
+	}
+	return remoteBams[bam];
 }
 
 // A reference picked on the page: the FASTA is read on demand, its .fai downloaded (written after the
@@ -217,9 +249,9 @@ async function run({ region, bam, index, verbose, reference, realigned, model: m
 	const ref = await useReference(py, reference);
 	const out = `/out${++runs}`; // fresh output directory per run
 	py.FS.mkdir(out);
-	const reads = mountBam(py, `/user/${runs}`, bam, index);
-	const pangenomePath = model.pangenome ? mountBam(py, `/user/${runs}-pangenome`, pangenome, pangenomeIndex) : undefined;
-	log(`\n=== DeepVariant (${modelKey.toUpperCase()} model) on ${region} (${bam.name}) ===`);
+	const reads = await useBam(py, `/user/${runs}`, bam, index);
+	const pangenomePath = model.pangenome ? await useBam(py, `/user/${runs}-pangenome`, pangenome, pangenomeIndex) : undefined;
+	log(`\n=== DeepVariant (${modelKey.toUpperCase()} model) on ${region} (${typeof bam === "string" ? bam : bam.name}) ===`);
 
 	await step("make_examples", () =>
 		dv.makeExamples(py, {
