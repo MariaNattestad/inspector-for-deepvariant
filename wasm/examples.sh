@@ -26,20 +26,22 @@ slice() {
 	echo "$name.bam: $(samtools view -c "$name.bam") reads"
 }
 
-# Illumina WGS (also the reads for pangenome-aware): 1 kb around 5 sites (partitions + some context)
+# Illumina WGS (also the reads for pangenome-aware): 1 kb around 7 sites (partitions + some context)
 slice HG003.chr20.inspect_examples case-study-testdata/HG003.novaseq.pcr-free.35x.dedup.grch38_no_alt.chr20.bam \
-	9155818 9157819 12441384 12443385 26262467 26264468 35437862 35439863 51725888 51727889
+	9155818 9157819 12441384 12443385 26262467 26264468 31459619 31461620 35437862 35439863 51725888 51727889 \
+	62490855 62492856
 # Illumina WES: the IDT capture interval around chr20:62,065,249 (idt_capture_novogene.grch38.bed)
 slice HG003.wes.chr20.inspect_examples exome-case-study-testdata/HG003.novaseq.wes_idt.100x.dedup.bam 62064450 62065810
 # PacBio HiFi and ONT R10.4.1: whole 25 kb partitions. The ONT BAM is the one the official 1.10 output came
 # from (its read depths match): not the 80x BAM the ONT case study names.
 slice HG003.pacbio.chr20.inspect_examples pacbio-case-study-testdata/HG003.SPRQ.pacbio.GRCh38.nov2024.chr20.bam \
-	325000 350000 800000 825000
+	325000 350000 800000 825000 8625000 8650000 9150000 9175000
 slice HG003.ont_r104.chr20.inspect_examples ont-case-study-testdata/HG003_PAY87794.calls.sorted.bam \
-	225000 250000 325000 350000
+	225000 250000 325000 350000 9150000 9175000 60025000 60050000
 # Hybrid PacBio HiFi + Illumina
 slice HG003.hybrid_pacbio_illumina.chr20.inspect_examples \
-	hybrid-case-study-testdata/HG003_hybrid_35x_ilmn_35x_pacb.grch38.phased.chr20.bam 4760752 4762753
+	hybrid-case-study-testdata/HG003_hybrid_35x_ilmn_35x_pacb.grch38.phased.chr20.bam 4760752 4762753 \
+	8642752 8644753 9155818 9157819
 
 # Pangenome-aware: HPRC v1.1's haplotypes around the two WGS sites it gets right, as a BAM
 # (tools/gbz_haplotypes_bam.py; graph: $GCS/pangenome-case-study-testdata/hprc-v1.1-mc-grch38.gbz.db)

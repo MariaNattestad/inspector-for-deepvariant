@@ -32,6 +32,10 @@ echo '[{"origin": ["*"], "method": ["GET", "HEAD"], "responseHeader": ["Content-
 gcloud storage buckets update gs://BUCKET --cors-file=cors.json
 ```
 
+To try it without your own data, the page links two whole-genome HG003 BAMs from DeepVariant's case studies
+(Illumina WGS 35x, 46.8 GB; PacBio HiFi, 50.3 GB). DeepVariant's bucket has no CORS, so they're read through
+[42basepairs](https://42basepairs.com), which serves it with range requests and CORS.
+
 On AWS S3, the same as a bucket CORS configuration (AllowedMethods GET and HEAD, AllowedOrigins `*`,
 ExposeHeaders Content-Length, Content-Range, Accept-Ranges). Links to a locus include the reads' URL, so a locus
 of data on such a server can be shared.

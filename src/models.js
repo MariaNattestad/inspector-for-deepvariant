@@ -22,8 +22,8 @@ export const CHANNELS = {
 
 // The examples are HG003 on GRCh38, chr20: the sample DeepVariant's case studies evaluate on (chr20 is held out
 // of training). Each is a site where the official DeepVariant 1.10 run disagrees with GIAB v4.2.1 (its hap.py
-// output, gs://deepvariant/case-study-outputs/1.10.0/) or a low-confidence call, cut from the case study's own
-// BAM. How they were picked and made: wasm/deepvariant/README.md ("Examples").
+// output, gs://deepvariant/case-study-outputs/1.10.0/), a low-confidence call, or a hard site it gets right
+// where another model doesn't, cut from the case study's own BAM. How they were picked and made: wasm/deepvariant/README.md ("Examples").
 const WGS_EXAMPLES_BAM = "data/HG003.chr20.inspect_examples.bam";
 
 // Each example also has a short label and its kind (missed, wrong genotype, extra allele, low confidence,
@@ -84,6 +84,24 @@ export const MODELS = [
 				kind: "extra allele",
 				truth: "CTTTTTTTTTT>C (a 10 bp poly-T deletion), 0/1",
 				official: "1/2 (GQ 29): the deletion plus an extra T that isn't there"
+			},
+			{
+				pos: 31460620,
+				what: "a 6 bp poly-A insertion, called",
+				label: "Poly-A insertion",
+				kind: "called",
+				truth: "C>CAAAAAA, 0/1",
+				official: "0/1 (GQ 16), by the small model",
+				note: "Only 2 of 32 reads support the full 6 bp insertion, and it's right. PacBio and ONT get its length wrong."
+			},
+			{
+				pos: 62491856,
+				what: "two 35 bp insertions, called",
+				label: "Two 35 bp insertions",
+				kind: "called",
+				truth: "C>C+35 bp and another 35 bp allele, 1/2",
+				official: "1/2 (GQ 5)",
+				note: "Right, though barely confident: pangenome-aware WGS calls it 1/1."
 			}
 		]
 	},
@@ -148,6 +166,24 @@ export const MODELS = [
 				truth: "GA>G, 0/1",
 				official: "no-call (./., GQ 6)",
 				note: "Oxford Nanopore misses it too (see the ONT examples)."
+			},
+			{
+				pos: 9156819,
+				what: "a CCTC repeat expansion, called",
+				label: "CCTC repeat",
+				kind: "called",
+				truth: "G>GCCTC and a longer CCTC expansion, 1/2",
+				official: "2|1 (GQ 58), by the small model",
+				note: "Long reads span the 20 bp expansion that short reads can't; Illumina WGS misses that allele."
+			},
+			{
+				pos: 8643753,
+				what: "a 30 bp insertion in a TC repeat, called",
+				label: "30 bp insertion",
+				kind: "called",
+				truth: "C>C+30 bp, 0/1",
+				official: "1|0 (GQ 26), by the small model",
+				note: "Illumina WGS and pangenome-aware WGS miss it."
 			}
 		]
 	},
@@ -183,6 +219,24 @@ export const MODELS = [
 				truth: "GA>G, 0/1",
 				official: "no-call (./., GQ 16)",
 				note: "PacBio misses it too (see the PacBio examples)."
+			},
+			{
+				pos: 9156819,
+				what: "a CCTC repeat expansion, called",
+				label: "CCTC repeat",
+				kind: "called",
+				truth: "G>GCCTC and a longer CCTC expansion, 1/2",
+				official: "1|2 (GQ 64), by the small model",
+				note: "Long reads span the 20 bp expansion that short reads can't; Illumina WGS misses that allele."
+			},
+			{
+				pos: 60029408,
+				what: "a 21 bp insertion, called",
+				label: "21 bp insertion",
+				kind: "called",
+				truth: "G>G+21 bp, 0/1",
+				official: "0|1 (GQ 21), by the small model",
+				note: "Illumina WGS and pangenome-aware WGS miss it."
 			}
 		]
 	},
@@ -209,6 +263,24 @@ export const MODELS = [
 				truth: "A>G, 1/1",
 				official: "0/1 (GQ 4)",
 				note: "All 63 reads support G. Next to it, DeepVariant also calls a false 2 bp insertion."
+			},
+			{
+				pos: 9156819,
+				what: "a CCTC repeat expansion, called",
+				label: "CCTC repeat",
+				kind: "called",
+				truth: "G>GCCTC and a longer CCTC expansion, 1/2",
+				official: "1/2 (GQ 61)",
+				note: "The PacBio reads span the expansion that the Illumina reads alone miss."
+			},
+			{
+				pos: 8643753,
+				what: "a 30 bp insertion in a TC repeat, called",
+				label: "30 bp insertion",
+				kind: "called",
+				truth: "C>C+30 bp, 0/1",
+				official: "0/1 (GQ 18)",
+				note: "Illumina WGS alone misses it."
 			}
 		]
 	},

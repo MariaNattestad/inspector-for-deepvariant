@@ -241,6 +241,10 @@ evaluate on; chr20 is held out of training), at sites where the official 1.10 ru
 - **PacBio**, **ONT**: errors in homopolymers, and a 1 bp deletion both miss (chr20:348,853).
 - **Hybrid**: a 1/1 SNP called 0/1 though all 63 reads support it. **WES**: a 1/1 deletion with GQ 9 (chr20 has
   only 3 WES errors: two have no reads, one is the 256-read site above).
+- **Called right**: hard sites the model gets right where another model doesn't, from the six hap.py outputs
+  (indels the model calls with the truth's genotype, ranked by how many other models get them wrong): a 6 bp
+  poly-A insertion and a 1/2 pair of 35 bp insertions (WGS), a 1/2 CCTC expansion (PacBio, ONT, hybrid), and
+  30 bp and 21 bp insertions WGS misses (PacBio, hybrid; ONT). All reproduce the official calls headlessly.
 
 ```bash
 ./wasm/examples.sh work/pangenome/hprc-v1.1-mc-grch38.gbz.db   # then ./wasm/build.sh copies them to data/

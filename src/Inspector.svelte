@@ -23,6 +23,25 @@ const REFERENCES = {
 const EXAMPLE_REFERENCE = "hg38"; // all examples are HG003 on GRCh38
 const PILEUP_HALF_WIDTH = 110; // what IGV shows around a call: about the width of a short-read pileup image
 const MAX_REGION = 200000; // bp: larger regions would take minutes in the browser
+// Whole-genome BAMs from DeepVariant's case studies, to try reads by URL: 42basepairs serves DeepVariant's
+// bucket with range requests and CORS (the bucket itself has no CORS)
+const URL_42BP = "https://42basepairs.com/download/gs/deepvariant";
+const BIG_BAMS = [
+	{
+		label: "Illumina WGS 35x",
+		size: "46.8 GB",
+		model: "wgs",
+		url: `${URL_42BP}/case-study-testdata/HG003.novaseq.pcr-free.35x.dedup.grch38_no_alt.bam`,
+		position: "chr20:31,460,620"
+	},
+	{
+		label: "PacBio HiFi",
+		size: "50.3 GB",
+		model: "pacbio",
+		url: `${URL_42BP}/pacbio-case-study-testdata/HG003.SPRQ.pacbio.GRCh38.nov2024.bam`,
+		position: "chr20:9,156,819"
+	}
+];
 
 // Inputs
 let modelKey = $state("wgs");
@@ -68,7 +87,8 @@ let pileupError = $state("");
 let readsInfo = $state(null); // {kind: "realigned" | "phased", window?, changed?, total?, url}
 let linkCopied = $state(false);
 let ranExample = $state.raw(null); // the example of the last run, if it was one
-let tab = $state("reads"); // the selected call's tab: "reads" | "pileups" | "calls" | "log"
+let tab = $state("calls"); // under the selected call: "calls" (all calls in the region) | "log"
+let pileupIndex = $state(0); // which of the selected call's pileup images is shown
 let openModel = $state("wgs"); // the model open in the examples list
 let editing = $state(true); // your data: the inputs are shown in full (else, after a run, as one line)
 let queued = false; // an example picked while another runs: run it next
@@ -404,6 +424,7 @@ function windowFor(call) {
 async function select(call) {
 	selected = call;
 	pileupsForSelected = [];
+	pileupIndex = 0;
 	pileupError = "";
 	const halfWidth = run.model.realigns ? PILEUP_HALF_WIDTH : 600; // long reads: a wider view
 	const locus = `${call.chrom}:${call.pos - halfWidth}-${call.pos + halfWidth}`;
@@ -564,6 +585,14 @@ function clearResults() {
 	if (igvBrowser) igvModule.removeBrowser(igvBrowser);
 	igvBrowser = null;
 }
+// A whole-genome BAM by URL, with its model and a position worth a look
+function tryBigBam(b) {
+	modelKey = b.model;
+	readsFrom = "url";
+	readsUrl = b.url;
+	indexUrl = "";
+	regionText = b.position;
+}
 export function pickSource(value) {
 	// The example's position isn't yours: leave it empty, to use where your reads are
 	if (value === "upload" && regionText === exampleRegion(model, example)) regionText = "";
@@ -603,12 +632,14 @@ onMount(() => {
 			if (source === "example") runDeepVariant(); // the home page shows an example, run as soon as it can be
 		} else if (m.type === "done") onDone(m);
 		else if (m.type === "pileups") {
-			run.pileupsPending.resolve(
-				m.images.map(({ name, bytes }) => ({
-					name: name.replace(/\.png$/, ""),
-					url: URL.createObjectURL(new Blob([bytes], { type: "image/png" }))
-				}))
-			);
+			const { pileupsPending, model: ranWith } = run;
+			Promise.all(
+				m.images.map(async ({ name, bytes }) => {
+					const url = URL.createObjectURL(new Blob([bytes], { type: "image/png" }));
+					const panels = await channelPanels(url, ranWith.channels.length).catch(() => null);
+					return { name: name.replace(/\.png$/, ""), url, panels };
+				})
+			).then(pileupsPending.resolve, pileupsPending.reject);
 		} else if (m.type === "error") {
 			if (run?.pileupsPending && calls.length) run.pileupsPending.reject(new Error(m.text));
 			else error = m.text;
@@ -662,11 +693,48 @@ const exampleCall = $derived.by(() => {
 	const closest = calls.toSorted((a, b) => near(a) - near(b))[0];
 	return near(closest) <= 50 ? closest : null;
 });
-const callText = (c) => `${c.GT} ${c.ref}>${c.alt}, GQ ${c.GQ}${c.filter === "PASS" ? "" : ` (${c.filter})`}`;
+// Long alleles, shortened for titles: CCCCCACCCC...AGCT (+35 bp); the full ones are in a tooltip
+const shortAllele = (allele, ref) => {
+	if (allele.length <= 12) return allele;
+	const d = allele.length - ref.length;
+	return `${allele.slice(0, 5)}…${allele.slice(-4)} (${d > 0 ? "+" : d < 0 ? "−" : ""}${Math.abs(d)} bp)`;
+};
+const alleles = (c) =>
+	`${shortAllele(c.ref, c.ref)} → ${c.alt
+		.split(",")
+		.map((a) => shortAllele(a, c.ref))
+		.join(", ")}`;
+const callText = (c) => `${c.GT} ${alleles(c)}, GQ ${c.GQ}${c.filter === "PASS" ? "" : ` (${c.filter})`}`;
 const elsewhere = $derived(source === "example" ? sameSiteElsewhere(model, example) : []);
-const showTab = (name) => {
-	tab = name;
-	if (name === "reads") tick().then(() => igvBrowser?.visibilityChange?.());
+// DeepVariant's pileup PNG (show_examples, nucleus vis.draw_deepvariant_pileup) is its channels side by side
+// under a 20 px row of labels, at 1 px per cell: cut it into one image per channel, to show them larger, labelled
+async function channelPanels(url, n) {
+	const img = await createImageBitmap(await (await fetch(url)).blob());
+	const HEADER = 20,
+		width = img.width / n,
+		height = img.height - HEADER;
+	if (!Number.isInteger(width) || height <= 0) return null;
+	return Promise.all(
+		Array.from({ length: n }, async (_, i) => {
+			const canvas = new OffscreenCanvas(width, height);
+			canvas.getContext("2d").drawImage(img, i * width, HEADER, width, height, 0, 0, width, height);
+			return URL.createObjectURL(await canvas.convertToBlob());
+		})
+	);
+}
+
+// A pileup image's name, chr20:25027778_C->AA|CA, as the alleles it shows: "C → AA and CA together"
+// (or, for long alleles, chr20:62491855_alt0INS5bp|alt1INS35bp: "+5 bp and +35 bp together")
+const pileupAlleles = (name) => {
+	const alleles = name.slice(name.lastIndexOf("_") + 1);
+	const short = alleles.match(/^(.+)->(.+)$/);
+	const alts = short
+		? short[2].split("|")
+		: alleles.split("|").map((a) => {
+				const m = a.match(/^alt\d+(INS|DEL)(\d+)bp$/);
+				return m ? `${m[1] === "INS" ? "+" : "−"}${m[2]} bp (alt ${Number(a.match(/^alt(\d+)/)[1]) + 1})` : a;
+			});
+	return `${short ? `${short[1]} → ` : ""}${alts.join(" and ")}${alts.length > 1 ? " together" : ""}`;
 };
 const fileName = (r) => (r.url ? r.url.split("/").pop().split("?")[0] : r.alignments?.name);
 </script>
@@ -685,7 +753,7 @@ const fileName = (r) => (r.url ? r.url.split("/").pop().split("?")[0] : r.alignm
 
 				<div class="field-row">
 					<div class="field-label">
-						<h2><span class="num">1</span> Model</h2>
+						<h2><span class="step-num">1</span> Model</h2>
 						<p class="hint">The <code>--model_type</code> you ran</p>
 					</div>
 					<div class="field-body">
@@ -709,7 +777,7 @@ const fileName = (r) => (r.url ? r.url.split("/").pop().split("?")[0] : r.alignm
 
 				<div class="field-row">
 					<div class="field-label">
-						<h2><span class="num">2</span> Reads</h2>
+						<h2><span class="step-num">2</span> Reads</h2>
 						<p class="hint">A BAM with its index (or a small BAM or SAM without one). The only required input.</p>
 					</div>
 					<div class="field-body">
@@ -758,6 +826,14 @@ const fileName = (r) => (r.url ? r.url.split("/").pop().split("?")[0] : r.alignm
 								{:else}Read with range requests, so only the locus is downloaded. The server must allow requests from other sites
 									(CORS): see the README for S3 and GCS.{/if}
 							</div>
+							<div class="try-urls">
+								<span class="hint">Try HG003, whole genome (DeepVariant's case studies, via 42basepairs):</span>
+								{#each BIG_BAMS as b (b.url)}
+									<button class="chip" class:on={readsUrl === b.url} onclick={() => tryBigBam(b)}
+										>{b.label} <span class="count">{b.size}</span></button
+									>
+								{/each}
+							</div>
 						{/if}
 						{#if readsSpan?.error}
 							<div class="hint bad">
@@ -791,7 +867,7 @@ const fileName = (r) => (r.url ? r.url.split("/").pop().split("?")[0] : r.alignm
 
 				<div class="field-row">
 					<div class="field-label">
-						<h2><span class="num">3</span> Where to look</h2>
+						<h2><span class="step-num">3</span> Where to look</h2>
 						<p class="hint">Filled in from your files where possible</p>
 					</div>
 					<div class="field-body two">
@@ -828,7 +904,7 @@ const fileName = (r) => (r.url ? r.url.split("/").pop().split("?")[0] : r.alignm
 
 				<div class="field-row">
 					<div class="field-label">
-						<h2><span class="num optional">4</span> Your VCF <span class="hint">optional</span></h2>
+						<h2><span class="step-num optional">4</span> Your VCF <span class="hint">optional</span></h2>
 						<p class="hint">Finds the calls worth a closer look, and compares each with this run</p>
 					</div>
 					<div class="field-body">
@@ -980,7 +1056,8 @@ const fileName = (r) => (r.url ? r.url.split("/").pop().split("?")[0] : r.alignm
 					{/each}
 				</div>
 				<p class="hint side-foot">
-					Sites where DeepVariant 1.10's official case-study run disagrees with GIAB v4.2.1, or isn't sure. Short reads
+					Sites where DeepVariant 1.10's official case-study run disagrees with GIAB v4.2.1 or isn't sure, and hard ones it gets
+					right. Short reads
 					<span class="key sr-key"></span> · long reads <span class="key lr-key"></span>
 				</p>
 			</aside>
@@ -1069,6 +1146,16 @@ const fileName = (r) => (r.url ? r.url.split("/").pop().split("?")[0] : r.alignm
 							<span class="hint">{model.name} example</span>
 							<h1>{example.what.charAt(0).toUpperCase() + example.what.slice(1)}</h1>
 							<span class="mono sub">chr20:{fmt(example.pos)} · runs on {exampleRegion(model, example)}</span>
+							{#if example.note || elsewhere.length}
+								<p class="ex-note">
+									{example.note ?? ""}
+									{#each elsewhere as o (o.model.key)}
+										<button class="link" onclick={() => inspectExample(o.model.key, o.index)}
+											>Same site with {o.model.name} →</button
+										>
+									{/each}
+								</p>
+							{/if}
 						</div>
 						<button class="secondary" onclick={copyLink}>{linkCopied ? "Link copied" : "Copy link"}</button>
 					</div>
@@ -1083,14 +1170,6 @@ const fileName = (r) => (r.url ? r.url.split("/").pop().split("?")[0] : r.alignm
 							{:else}<b class="muted">–</b>{/if}
 						</div>
 					</div>
-					{#if example.note || elsewhere.length}
-						<div class="note">
-							{#if example.note}<p>{example.note}</p>{/if}
-							{#each elsewhere as o (o.model.key)}
-								<button class="link" onclick={() => inspectExample(o.model.key, o.index)}>Same site with {o.model.name} →</button>
-							{/each}
-						</div>
-					{/if}
 					{#if busy || !finished}
 						<div class="steps">
 							{#each Object.entries(STEP_NAMES) as [key, label] (key)}
@@ -1108,91 +1187,84 @@ const fileName = (r) => (r.url ? r.url.split("/").pop().split("?")[0] : r.alignm
 			{#if selected}
 				{@const probs = genotypeProbabilities(selected)}
 				{@const yours = yourRecords ? yoursFor(selected) : null}
-				<div class="card">
-					<div class="head-row">
+				<div class="card call-card">
+					<div class="call-main">
 						<div>
-							<span class="hint">{source === "example" ? "This run's call" : `${ranModel.name} · ${ranRegion}`}</span>
+							{#if source === "upload"}<span class="hint">{ranModel.name} · {ranRegion}</span>{/if}
 							<h2 class="call-title mono">
-								{selected.chrom}:{fmt(selected.pos)} <span class="muted">{selected.ref} → {selected.alt}</span>
+								{selected.chrom}:{fmt(selected.pos)}
+								<span class="muted" title="{selected.ref} → {selected.alt}">{alleles(selected)}</span>
 							</h2>
+						</div>
+						<div class="stat-chips">
+							<span><span class="k">genotype</span> <b class="mono">{selected.GT}</b></span>
+							<span
+								><span class="k">GQ</span> <b>{selected.GQ}</b>
+								<span class="hint">{(10 ** (-Number(selected.GQ) / 10) * 100).toPrecision(2)}% chance wrong</span></span
+							>
+							<span><span class="k">filter</span> <b>{selected.filter}</b> <span class="hint">QUAL {selected.qual}</span></span>
+							<span><span class="k">depth</span> <b>{selected.DP}</b> <span class="hint">AD {selected.AD}</span></span>
+							<span><span class="k">called by</span> <b>{modelName(selected.MID)}</b></span>
 						</div>
 						{#if source === "upload"}<button class="secondary" onclick={copyLink}
 								>{linkCopied ? "Link copied" : "Copy link"}</button
 							>{/if}
 					</div>
-					<div class="stats">
-						<div><span class="hint">Genotype</span><b class="mono">{selected.GT}</b></div>
-						<div>
-							<span class="hint">GQ</span><b>{selected.GQ}</b>
-							<span class="hint">{(10 ** (-Number(selected.GQ) / 10) * 100).toPrecision(2)}% chance it's wrong</span>
+					<div class="call-probs">
+						<h3>Genotype probabilities <span class="hint">from PL</span></h3>
+						<div class="probs">
+							{#each probs.filter((x) => x.p >= 0.001 || probs.length <= 3) as { gt, p } (gt)}
+								<div class="prob" title="{gt}: {p.toPrecision(3)}">
+									<span class="gt">{gt}</span>
+									<div class="prob-bar"><div style="width: {Math.max(0.5, p * 100)}%"></div></div>
+									<span class="p">{p >= 0.001 ? `${(p * 100).toFixed(1)}%` : p.toExponential(0)}</span>
+								</div>
+							{/each}
 						</div>
-						<div><span class="hint">Filter · QUAL</span><b>{selected.filter} · {selected.qual}</b></div>
-						<div><span class="hint">Depth · allele depths</span><b>{selected.DP} · {selected.AD}</b></div>
-						<div><span class="hint">Called by</span><b>{modelName(selected.MID)}</b></div>
+						{#if probs.length > 3 && probs.some((x) => x.p < 0.001)}
+							<p class="hint">{probs.filter((x) => x.p < 0.001).length} other genotypes: under 0.1% each.</p>
+						{/if}
+						{#if selected.filter === "NoCall"}<p class="hint">NoCall (./.): no genotype was likely enough to call.</p>{/if}
+						{#if selected.filter === "RefCall"}<p class="hint">RefCall: DeepVariant thinks this candidate is reference.</p>{/if}
 					</div>
-					<div class="detail">
-						<div>
-							<h3>Genotype probabilities</h3>
-							<div class="probs">
-								{#each probs as { gt, p } (gt)}
-									<div class="prob" title="{gt}: {p.toPrecision(3)}">
-										<span class="gt">{gt}</span>
-										<div class="prob-bar"><div style="width: {Math.max(0.5, p * 100)}%"></div></div>
-										<span class="p">{p >= 0.001 ? `${(p * 100).toFixed(1)}%` : p.toExponential(0)}</span>
-									</div>
-								{/each}
-							</div>
-							<p class="hint">
-								From PL.
-								{#if selected.filter === "NoCall"}NoCall (./.): no genotype was likely enough to call.{/if}
-								{#if selected.filter === "RefCall"}RefCall: DeepVariant thinks this candidate is reference.{/if}
-							</p>
-						</div>
-						<div>
-							<h3>How it was called</h3>
-							<ul class="how">
-								<li>
-									{#if selected.MID === "small_model"}
-										By the <b>small model</b>, from summary features (allele counts, base and mapping qualities) instead of a
-										pileup image: DeepVariant uses it for candidates it can call confidently.
-									{:else}
-										By the <b>CNN</b>, from the pileup images (one per alternate allele, or pair of them).
-									{/if}
-								</li>
-								{#if readsInfo?.kind === "realigned"}
-									<li>
-										Local realignment changed <b
-											>{readsInfo.changed ? `${readsInfo.changed} of ${readsInfo.total}` : `none of the ${readsInfo.total}`}</b
-										>
-										reads in <span class="mono">{readsInfo.window}</span>.
-										<a href={readsInfo.url} download="realigned_reads.bam">Download the realigned reads</a>
-									</li>
-								{:else if readsInfo?.kind === "phased"}
-									<li>
-										Not realigned: DeepVariant phases long reads itself and sorts the pileup rows by haplotype.
-										<a href={readsInfo.url} download="phased_by_deepvariant.bam">Download the phased reads</a>
-									</li>
-								{/if}
-								{#if ranModel.pangenome}
-									<li>
-										Pangenome-aware: the top half of each pileup image is the pangenome's haplotypes, the bottom half the reads.
-									</li>
-								{/if}
-							</ul>
-							{#if yourRecords}
-								<h3>Your VCF</h3>
-								{#if !yours}
-									<p class="hint">No record here.</p>
-								{:else if agrees(selected)}
-									<p class="ok">Same call: {yours.GT}, {yours.filter}, GQ {yours.GQ}.</p>
+					<div class="call-how">
+						<h3>How it was called</h3>
+						<ul class="how">
+							<li>
+								{#if selected.MID === "small_model"}
+									By the <b>small model</b>, from summary features (allele counts, base and mapping qualities): no pileup image.
 								{:else}
-									<p class="differs">
-										Yours says {yours.GT}, {yours.filter}, GQ {yours.GQ}. Differences can come from another DeepVariant version,
-										model or flags; and where more reads cover a site than fit in a pileup image, from which reads were sampled.
-									</p>
+									By the <b>CNN</b>, from the pileup images below.
 								{/if}
+							</li>
+							{#if readsInfo?.kind === "realigned"}
+								<li>
+									Local realignment changed <b
+										>{readsInfo.changed ? `${readsInfo.changed} of ${readsInfo.total}` : `none of the ${readsInfo.total}`}</b
+									>
+									reads in <span class="mono">{readsInfo.window}</span>.
+									<a href={readsInfo.url} download="realigned_reads.bam">Download them</a>
+								</li>
+							{:else if readsInfo?.kind === "phased"}
+								<li>
+									Not realigned: DeepVariant phases long reads itself and sorts the pileup rows by haplotype.
+									<a href={readsInfo.url} download="phased_by_deepvariant.bam">Download the phased reads</a>
+								</li>
 							{/if}
-						</div>
+							{#if ranModel.pangenome}
+								<li>
+									Pangenome-aware: the top half of each pileup image is the pangenome's haplotypes, the bottom half the reads.
+								</li>
+							{/if}
+							{#if yourRecords}
+								<li class:ok={yours && agrees(selected)} class:differs={yours && !agrees(selected)}>
+									{#if !yours}Your VCF has no record here.
+									{:else if agrees(selected)}Your VCF agrees: {yours.GT}, {yours.filter}, GQ {yours.GQ}.
+									{:else}Your VCF says {yours.GT}, {yours.filter}, GQ {yours.GQ}: another version, model or flags, or (where more
+										reads cover a site than fit in a pileup image) other sampled reads.{/if}
+								</li>
+							{/if}
+						</ul>
 					</div>
 				</div>
 			{:else if finished && !calls.length}
@@ -1201,75 +1273,95 @@ const fileName = (r) => (r.url ? r.url.split("/").pop().split("?")[0] : r.alignm
 				<div class="card"><p class="hint">Pick a call on the left, or run DeepVariant above.</p></div>
 			{/if}
 
-			<!-- What DeepVariant looked at -->
+			{#if calls.length}
+				<!-- The reads, as aligned and as DeepVariant saw them -->
+				<div class="card view-card">
+					<div class="view-head">
+						<h3>{ranModel?.realigns ? "Reads before and after realignment" : "Reads as aligned and as phased"}</h3>
+						<span class="hint"
+							>{#if ranModel?.realigns}Your reads as IGV shows them, then after DeepVariant's local realignment: what it saw.{:else}Your
+								reads as aligned, then grouped by DeepVariant's own phasing (as the pileup rows are).{/if}</span
+						>
+					</div>
+					<div class="igv" bind:this={divIgv}></div>
+				</div>
+
+				<!-- The pileup images the CNN classified, one panel per channel -->
+				<div class="card view-card">
+					<div class="view-head">
+						<h3>Pileup images</h3>
+						{#if selected?.MID === "small_model"}
+							<span class="hint"
+								>None: the small model called this from summary features, so the CNN never saw a pileup image.</span
+							>
+						{:else if pileupError}
+							<span class="bad">Couldn't draw the pileup images: {pileupError}</span>
+						{:else if !pileupsForSelected.length}
+							<span class="hint">Drawing pileup images…</span>
+						{:else}
+							<span class="hint"
+								>What the CNN classified: rows are {ranModel.pangenome ? "pangenome haplotypes, then reads" : "reads"}, columns
+								positions; the tick marks the candidate. Hover a panel for what it encodes.</span
+							>
+						{/if}
+					</div>
+					{#if selected?.MID !== "small_model" && pileupsForSelected.length}
+						{@const shown = pileupsForSelected[Math.min(pileupIndex, pileupsForSelected.length - 1)]}
+						{#if pileupsForSelected.length > 1}
+							<div class="pileup-picker" role="tablist" aria-label="Pileup image">
+								{#each pileupsForSelected as p, i (p.name)}
+									<button role="tab" class:on={p === shown} aria-selected={p === shown} onclick={() => (pileupIndex = i)}
+										>{pileupAlleles(p.name)}</button
+									>
+								{/each}
+							</div>
+						{:else}
+							<p class="hint mono">{pileupAlleles(shown.name)}</p>
+						{/if}
+						{#if shown.panels}
+							<div class="channel-grid" style="--cols: {Math.ceil(shown.panels.length / 2)}">
+								{#each shown.panels as src, i (i)}
+									{@const ch = CHANNELS[ranModel.channels[i]]}
+									<figure class="channel" title={ch?.about ?? ""}>
+										<figcaption>{ch?.name ?? `channel ${ranModel.channels[i]}`}</figcaption>
+										<div class="channel-img"><img {src} alt="{ch?.name ?? 'channel'} channel of {shown.name}" /></div>
+									</figure>
+								{/each}
+							</div>
+						{:else}
+							<img class="pileup-whole" src={shown.url} alt="pileup image {shown.name}" />
+						{/if}
+						<a class="hint" href={shown.url} download="{shown.name}.png">Download DeepVariant's PNG</a>
+					{/if}
+				</div>
+			{/if}
+
+			<!-- Every call in the region, and the log -->
 			<div class="card tabs-card">
 				<div class="tabs" role="tablist">
 					{#if calls.length}
-						<button role="tab" class:on={tab === "reads"} aria-selected={tab === "reads"} onclick={() => showTab("reads")}
-							>{ranModel?.realigns ? "Reads: before vs after realignment" : "Reads: as aligned vs phased"}</button
-						>
-						<button role="tab" class:on={tab === "pileups"} aria-selected={tab === "pileups"} onclick={() => showTab("pileups")}
-							>Pileup images {#if pileupsForSelected.length}<span class="count">{pileupsForSelected.length}</span>{/if}</button
-						>
-						<button role="tab" class:on={tab === "calls"} aria-selected={tab === "calls"} onclick={() => showTab("calls")}
+						<button role="tab" class:on={tab === "calls"} aria-selected={tab === "calls"} onclick={() => (tab = "calls")}
 							>All calls in this region <span class="count">{calls.length}</span></button
 						>
 					{/if}
 					<button
 						role="tab"
 						class:on={tab === "log" || !calls.length}
-						aria-selected={tab === "log"}
-						onclick={() => showTab("log")}>Log</button
+						aria-selected={tab === "log" || !calls.length}
+						onclick={() => (tab = "log")}>Log</button
 					>
 				</div>
 
 				{#if calls.length}
-					<div class="panel" hidden={tab !== "reads"}>
-						<p class="hint">
-							{#if ranModel?.realigns}Your reads as IGV shows them, and after DeepVariant's local realignment: what it saw.{:else}Your
-								reads as aligned, and as DeepVariant phased them (grouped by haplotype, as the pileup rows are).{/if}
-						</p>
-						<div class="igv" bind:this={divIgv}></div>
-					</div>
-
-					<div class="panel" hidden={tab !== "pileups"}>
-						{#if selected?.MID === "small_model"}
-							<p class="hint">
-								None: the small model called this from summary features, so the CNN never looked at a pileup image.
-							</p>
-						{:else if pileupError}
-							<p class="bad">Couldn't draw the pileup images: {pileupError}</p>
-						{:else if pileupsForSelected.length}
-							<p class="hint">
-								What the CNN classified (show_examples): rows are {ranModel.pangenome
-									? "pangenome haplotypes, then reads"
-									: "reads"}, columns are positions centered on the candidate, and each panel is one channel:
-							</p>
-							<ol class="channels">
-								{#each ranModel.channels as ch (ch)}
-									<li title={CHANNELS[ch]?.about ?? ""}><b>{CHANNELS[ch]?.name ?? `channel ${ch}`}</b></li>
-								{/each}
-							</ol>
-							{#each pileupsForSelected as p (p.name)}
-								<figure>
-									<a href={p.url} download="{p.name}.png"><img src={p.url} alt="pileup image {p.name}" /></a>
-									<figcaption>{p.name}</figcaption>
-								</figure>
-							{/each}
-						{:else}
-							<p class="hint">Drawing pileup images…</p>
-						{/if}
-					</div>
-
 					<div class="panel" hidden={tab !== "calls"}>
 						<p class="hint">Every call in {ranRegion} ({ranModel.modelType} model). Click one to inspect it.</p>
 						<div class="tablewrap">
 							<table>
 								<thead>
 									<tr
-										><th>position</th><th>ref</th><th>alt</th><th>genotype</th><th>GQ</th><th>QUAL</th><th>filter</th><th
-											>depth</th
-										><th>allele depths</th><th>called by</th>{#if yourRecords}<th>your VCF</th>{/if}</tr
+										><th>position</th><th>ref</th><th>alt</th><th>genotype</th><th class="num">GQ</th><th class="num">QUAL</th><th
+											>filter</th
+										><th class="num">depth</th><th>allele depths</th><th>called by</th>{#if yourRecords}<th>your VCF</th>{/if}</tr
 									>
 								</thead>
 								<tbody>
@@ -1282,10 +1374,11 @@ const fileName = (r) => (r.url ? r.url.split("/").pop().split("?")[0] : r.alignm
 											onclick={() => select(call)}
 											onkeydown={(e) => e.key === "Enter" && select(call)}
 										>
-											<td>{call.chrom}:{fmt(call.pos)}</td><td class="allele">{call.ref}</td><td class="allele">{call.alt}</td><td
-												>{call.GT}</td
-											><td class="num">{call.GQ}</td><td class="num">{call.qual}</td><td>{call.filter}</td><td class="num"
-												>{call.DP}</td
+											<td>{call.chrom}:{fmt(call.pos)}</td><td class="allele" title={call.ref}>{call.ref}</td><td
+												class="allele"
+												title={call.alt}>{call.alt}</td
+											><td>{call.GT}</td><td class="num">{call.GQ}</td><td class="num">{call.qual}</td><td>{call.filter}</td><td
+												class="num">{call.DP}</td
 											><td>{call.AD}</td><td>{modelName(call.MID)}</td>
 											{#if yourRecords}
 												<td class:differs={yours && !agrees(call)}
@@ -1324,7 +1417,7 @@ const fileName = (r) => (r.url ? r.url.split("/").pop().split("?")[0] : r.alignm
 		sans-serif;
 }
 h1 {
-	font-size: 22px;
+	font-size: 19px;
 	line-height: 1.25;
 	margin: 2px 0 4px;
 }
@@ -1363,7 +1456,7 @@ p {
 	background: var(--bg);
 	border: 1px solid var(--line);
 	border-radius: 12px;
-	padding: 20px 22px;
+	padding: 16px 18px;
 }
 button {
 	font: inherit;
@@ -1440,7 +1533,7 @@ button:focus-visible {
 	grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
 	gap: 16px;
 }
-.num {
+.step-num {
 	display: inline-grid;
 	place-items: center;
 	width: 20px;
@@ -1451,10 +1544,16 @@ button:focus-visible {
 	color: var(--bg);
 	font-size: 11px;
 }
-.num.optional {
+.step-num.optional {
 	background: none;
 	color: var(--muted);
 	border: 1.5px dashed var(--muted);
+}
+.try-urls {
+	display: flex;
+	flex-wrap: wrap;
+	align-items: center;
+	gap: 6px;
 }
 .sublabel {
 	display: block;
@@ -1909,14 +2008,18 @@ button.run:disabled {
 	align-items: flex-start;
 	justify-content: space-between;
 	gap: 12px;
-	margin-bottom: 16px;
+	margin-bottom: 10px;
+}
+.head-row > div {
+	flex: 1 1 0;
+	min-width: 0;
 }
 .sub {
 	font-size: 13px;
 	color: var(--muted);
 }
 .call-title {
-	font-size: 18px;
+	font-size: 16px;
 	margin-top: 2px;
 }
 .compare,
@@ -1933,8 +2036,8 @@ button.run:disabled {
 .stats > div {
 	display: flex;
 	flex-direction: column;
-	gap: 4px;
-	padding: 12px 14px;
+	gap: 2px;
+	padding: 8px 12px;
 	background: var(--bg);
 }
 .compare b {
@@ -1947,19 +2050,12 @@ button.run:disabled {
 .stats b {
 	font-size: 17px;
 }
-.note {
-	display: flex;
-	flex-wrap: wrap;
-	align-items: center;
-	gap: 4px 16px;
-	margin-top: 12px;
-	padding: 10px 14px;
-	background: var(--bg-subtle);
-	border-radius: 8px;
+.ex-note {
+	margin-top: 6px;
 	font-size: 13px;
 }
-.note p {
-	flex: 1 1 320px;
+.ex-note .link {
+	margin-left: 8px;
 }
 .card > .steps,
 .card > .bad {
@@ -1968,8 +2064,8 @@ button.run:disabled {
 .detail {
 	display: grid;
 	grid-template-columns: minmax(220px, 1fr) 1.4fr;
-	gap: 16px 28px;
-	margin-top: 18px;
+	gap: 12px 28px;
+	margin-top: 12px;
 }
 @media (max-width: 760px) {
 	.detail {
@@ -1977,7 +2073,7 @@ button.run:disabled {
 	}
 }
 .how {
-	margin: 0 0 12px;
+	margin: 0;
 	padding-left: 18px;
 	display: flex;
 	flex-direction: column;
@@ -2013,7 +2109,128 @@ button.run:disabled {
 	color: var(--muted);
 }
 
-/* Tabs: what DeepVariant looked at */
+/* The selected call: a compact header, then what DeepVariant looked at */
+/* Side by side when there's room: the call, its genotype probabilities, how it was called */
+.call-card {
+	padding: 14px 18px;
+	display: flex;
+	flex-wrap: wrap;
+	gap: 12px 28px;
+}
+.call-main {
+	flex: 1.2 1 300px;
+	display: flex;
+	flex-direction: column;
+	align-items: flex-start;
+	gap: 8px;
+}
+.call-probs {
+	flex: 0.8 1 220px;
+}
+.call-how {
+	flex: 1.2 1 260px;
+}
+.stat-chips {
+	display: flex;
+	flex-wrap: wrap;
+	gap: 6px;
+}
+.stat-chips > span {
+	display: inline-flex;
+	align-items: baseline;
+	gap: 5px;
+	padding: 4px 10px;
+	border: 1px solid var(--line);
+	border-radius: 8px;
+	background: var(--bg-subtle);
+	font-size: 13px;
+	white-space: nowrap;
+}
+.stat-chips .k {
+	color: var(--muted);
+	font-size: 12px;
+}
+.view-card {
+	padding: 14px 18px;
+	display: flex;
+	flex-direction: column;
+	gap: 10px;
+}
+.view-head {
+	display: flex;
+	flex-wrap: wrap;
+	align-items: baseline;
+	gap: 4px 12px;
+}
+.view-head h3 {
+	margin: 0;
+}
+.pileup-picker {
+	display: flex;
+	flex-wrap: wrap;
+	gap: 6px;
+}
+.pileup-picker button {
+	padding: 4px 10px;
+	border: 1px solid var(--line);
+	border-radius: 999px;
+	background: var(--bg);
+	font:
+		12px ui-monospace,
+		monospace;
+	cursor: pointer;
+}
+.pileup-picker button.on {
+	border-color: var(--accent);
+	background: var(--accent-subtle);
+	color: var(--accent);
+}
+/* Channels in two rows, each pixel a cell */
+.channel-grid {
+	display: grid;
+	grid-template-columns: repeat(var(--cols), minmax(0, 1fr));
+	gap: 10px 8px;
+}
+@media (max-width: 760px) {
+	.channel-grid {
+		grid-template-columns: repeat(2, minmax(0, 1fr));
+	}
+}
+.channel {
+	margin: 0;
+}
+.channel figcaption {
+	font-size: 12px;
+	font-weight: 500;
+	margin-bottom: 3px;
+	white-space: nowrap;
+	overflow: hidden;
+	text-overflow: ellipsis;
+}
+.channel-img {
+	position: relative;
+	padding-top: 5px;
+}
+/* The candidate: the center column */
+.channel-img::before {
+	content: "";
+	position: absolute;
+	top: 0;
+	left: 50%;
+	height: 5px;
+	border-left: 2px solid var(--danger);
+	transform: translateX(-1px);
+}
+.channel img,
+.pileup-whole {
+	display: block;
+	width: 100%;
+	image-rendering: pixelated;
+	border-radius: 3px;
+	background: #000;
+}
+
+/* All calls, and the log */
 .tabs-card {
 	padding: 0;
 	overflow: hidden;
@@ -2022,11 +2239,11 @@ button.run:disabled {
 	display: flex;
 	flex-wrap: wrap;
 	gap: 0 22px;
-	padding: 0 22px;
+	padding: 0 18px;
 	border-bottom: 1px solid var(--line);
 }
 .tabs button {
-	padding: 12px 2px;
+	padding: 10px 2px;
 	margin-bottom: -1px;
 	border: 0;
 	border-bottom: 2px solid transparent;
@@ -2045,7 +2262,7 @@ button.run:disabled {
 	font-weight: 400;
 }
 .panel {
-	padding: 16px 22px 20px;
+	padding: 12px 18px 16px;
 	display: flex;
 	flex-direction: column;
 	gap: 10px;
@@ -2058,36 +2275,7 @@ button.run:disabled {
 	border-radius: 8px;
 	min-height: 200px;
 	background: #fff;
-}
-.channels {
-	columns: 3 180px;
-	font-size: 12px;
-	color: var(--muted);
-	margin: 0;
-	padding-left: 20px;
-}
-.channels b {
-	color: var(--fg);
-	font-weight: 500;
-}
-figure {
-	margin: 0;
-}
-figure img {
-	display: block;
-	width: 100%;
-	max-width: 1547px;
-	image-rendering: pixelated;
-	border: 1px solid var(--line);
-	border-radius: 4px;
-	background: #000;
-}
-figcaption {
-	font:
-		12px ui-monospace,
-		monospace;
-	color: var(--muted);
-	margin-top: 4px;
+	overflow: hidden;
 }
 .tablewrap {
 	overflow: auto;
@@ -2114,7 +2302,8 @@ th {
 	top: 0;
 	background: var(--bg-subtle);
 }
-td.num {
+td.num,
+th.num {
 	text-align: right;
 }
 td.allele {
