@@ -34,8 +34,11 @@ jobs:
         with:
           path: dist
 
+  # Only once the repo is public: a Pages site of a private repo would be public anyway (and needs a paid plan).
+  # Then enable Pages (Settings > Pages > Source: GitHub Actions).
   deploy:
     needs: build
+    if: ${{ !github.event.repository.private }}
     runs-on: ubuntu-latest
     environment:
       name: github-pages
