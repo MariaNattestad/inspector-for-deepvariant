@@ -1,0 +1,12 @@
+node_modules
+dist
+.DS_Store
+
+# DeepVariant for the browser: built by wasm/build.sh or downloaded by `npm run assets` (see README)
+public/deepvariant/
+
+# Build cache of wasm/build.sh
+wasm/build/
+
+# Large working files: model conversion, test data, the pangenome database (see README: "work/")
+work/

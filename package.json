@@ -1,0 +1,31 @@
+{
+	"name": "inspector-for-deepvariant",
+	"version": "0.1.0",
+	"private": true,
+	"type": "module",
+	"description": "Rerun DeepVariant in the browser on any locus of your data, and see what it looked at.",
+	"scripts": {
+		"dev": "vite",
+		"build": "vite build",
+		"preview": "vite preview",
+		"assets": "./scripts/fetch-assets.sh",
+		"lint": "prettier --check . && eslint .",
+		"format": "prettier --write ."
+	},
+	"dependencies": {
+		"@biowasm/aioli": "3.2.1",
+		"igv": "3.2.6"
+	},
+	"devDependencies": {
+		"@eslint/js": "9.39.1",
+		"@sveltejs/vite-plugin-svelte": "5.1.1",
+		"eslint": "9.39.1",
+		"eslint-config-prettier": "10.1.8",
+		"eslint-plugin-svelte": "3.5.1",
+		"globals": "16.0.0",
+		"prettier": "3.5.3",
+		"prettier-plugin-svelte": "3.3.3",
+		"svelte": "5.45.2",
+		"vite": "6.4.1"
+	}
+}

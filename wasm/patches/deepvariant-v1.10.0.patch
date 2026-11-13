@@ -1,0 +1,225 @@
+diff --git a/deepvariant/allelecounter.cc b/deepvariant/allelecounter.cc
+index 3982977..6b9a0c2 100644
+--- a/deepvariant/allelecounter.cc
++++ b/deepvariant/allelecounter.cc
+@@ -308,7 +308,7 @@ void AlleleCounter::Init() {
+   auto full_interval_offset = interval_.start() - reads_interval_.start();
+   // If interval_ starts before reads_interval_ start then we don't need to
+   // offset reference bases.
+-  full_interval_offset = std::max(full_interval_offset, 0L);
++  full_interval_offset = std::max(full_interval_offset, int64_t{0});
+   for (int i = 0; i < len; ++i) {
+     AlleleCount allele_count;
+     const int64_t pos = interval_.start() + i;
+diff --git a/deepvariant/alt_aligned_pileup_lib.cc b/deepvariant/alt_aligned_pileup_lib.cc
+index e05ca28..34b44a7 100644
+--- a/deepvariant/alt_aligned_pileup_lib.cc
++++ b/deepvariant/alt_aligned_pileup_lib.cc
+@@ -149,7 +149,7 @@ void TrimCigar(const ::google::protobuf::RepeatedPtrField<CigarUnit>& cigar,
+ Read TrimRead(const Read& read, const Range& region) {
+   int64_t read_start = read.alignment().position().position();
+   // Ref position where trimmed read should start.
+-  int64_t trim_left = std::max(region.start() - read_start, 0L);
++  int64_t trim_left = std::max(region.start() - read_start, int64_t{0});
+   // Ref length of the trimmed read.
+   int64_t ref_length = region.end() - std::max(region.start(), read_start);
+   CHECK_GT(ref_length, 0);
+@@ -226,7 +226,7 @@ Range CalculateAlignmentRegion(const Variant& variant, int half_width,
+   int64_t n_ref_bases = variant.reference_bases().size();
+   int64_t ref_end = ref_start + n_ref_bases;
+   alignment_region.set_reference_name(variant.reference_name());
+-  alignment_region.set_start(std::max(variant.start() - half_width, 0L));
++  alignment_region.set_start(std::max(variant.start() - half_width, int64_t{0}));
+   alignment_region.set_end(std::min(
+       ref_reader.Contig(variant.reference_name()).ValueOrDie()->n_bases(),
+       ref_end + half_width));
+@@ -291,7 +291,7 @@ std::vector<Read> RealignReadsToHaplotype(
+   realigner.set_options(aln_config);
+   // Both reference and haplotype are padded with typically 20 bases from the
+   // reference.
+-  int64_t ref_start_ext = std::max(0L, ref_start - kRefAlignMargin);
++  int64_t ref_start_ext = std::max(int64_t{0}, ref_start - kRefAlignMargin);
+   int64_t ref_end_ext =
+       std::min(ref_reader.Contig(std::string(contig)).ValueOrDie()->n_bases(),
+                ref_end + kRefAlignMargin);
+diff --git a/deepvariant/make_examples_native.cc b/deepvariant/make_examples_native.cc
+index 1054a6e..b85ee14 100644
+--- a/deepvariant/make_examples_native.cc
++++ b/deepvariant/make_examples_native.cc
+@@ -276,7 +276,7 @@ std::string ExamplesGenerator::CreateHaplotype(const Variant& variant,
+   int64_t var_end = var_start + ref_bases.size();
+ 
+   std::string prefix = "";
+-  int64_t ref_start = std::max(var_start - half_width_, 0L);
++  int64_t ref_start = std::max(var_start - half_width_, int64_t{0});
+   if (ref_start < var_start) {
+     prefix =
+         ref_reader_->GetBases(
+@@ -518,7 +518,7 @@ std::string ExamplesGenerator::GetReferenceBasesForPileup(
+   int64_t start = variant.start() - half_width_;
+   int64_t end = start + options_.pic_options().width();
+ 
+-  int region_start = std::max(0L, start);
++  int region_start = std::max(int64_t{0}, start);
+   int region_end = std::min(n_bases, end);
+   Range region;
+   region.set_reference_name(variant.reference_name());
+diff --git a/third_party/nucleus/util/proto_ptr.h b/third_party/nucleus/util/proto_ptr.h
+index 05c0eef..cd30e52 100644
+--- a/third_party/nucleus/util/proto_ptr.h
++++ b/third_party/nucleus/util/proto_ptr.h
+@@ -35,6 +35,8 @@
+ // CLIF normally will serialize/deserialize protocol
+ // buffers when passing them from C++ to/from Python.
+ // These wrappers disable that default handling.
++#include <memory>
++
+ namespace nucleus {
+ 
+ // Use this wrapper when the C++ code fills in an EMPTY
+@@ -48,6 +50,7 @@ class EmptyProtoPtr {
+   EmptyProtoPtr() : p_(nullptr) {}
+ 
+   T* p_;
++  std::shared_ptr<void> keep_alive_;  // wasm build: owns the C++ copy of the Python proto
+ };
+ 
+ // Use this wrapper when the C++ code reads, but does
+@@ -59,6 +62,7 @@ class ConstProtoPtr {
+   ConstProtoPtr() : p_(nullptr) {}
+ 
+   const T* p_;
++  std::shared_ptr<const void> keep_alive_;  // wasm build: owns the C++ copy of the Python proto
+ };
+ 
+ }  // namespace nucleus
+diff --git a/third_party/nucleus/util/proto_utils.py b/third_party/nucleus/util/proto_utils.py
+index e28daa6..977b810 100644
+--- a/third_party/nucleus/util/proto_utils.py
++++ b/third_party/nucleus/util/proto_utils.py
+@@ -37,7 +37,7 @@ from google.protobuf.internal import api_implementation
+ 
+ def uses_fast_cpp_protos_or_die():
+   """Raises an error if a slow protobuf implementation is being used."""
+-  if api_implementation.Type() != 'cpp':
++  if api_implementation.Type() not in ('cpp', 'upb'):  # upb: protobuf >= 4's C backend
+     raise ValueError('Expected to be using C++ protobuf implementation '
+                      '(api_implementation.Type() == "cpp") but it is {}'.format(
+                          api_implementation.Type()))
+diff --git a/third_party/nucleus/util/python/type_caster_nucleus_proto_ptr.h b/third_party/nucleus/util/python/type_caster_nucleus_proto_ptr.h
+index eb73aad..35f671f 100644
+--- a/third_party/nucleus/util/python/type_caster_nucleus_proto_ptr.h
++++ b/third_party/nucleus/util/python/type_caster_nucleus_proto_ptr.h
+@@ -41,44 +41,26 @@
+ #include "absl/log/absl_log.h"
+ #include "third_party/nucleus/util/proto_ptr.h"
+ #include "google/protobuf/message.h"
+-#include "python/google/protobuf/proto_api.h"
+-#include "pybind11/gil_safe_call_once.h"
++#include <string>
++#include <type_traits>
++
++// wasm build: Python protos here are upb messages, which can't share memory with C++ (the
++// original version reaches into the "cpp" Python protobuf backend via PyProto_API). Instead
++// the casters copy: Python -> C++ by serializing, and for EmptyProtoPtr the C++ result is
++// copied back into the Python object once the last EmptyProtoPtr copy is gone (after the
++// call). The copy is owned by ProtoPtr::keep_alive_, so it lives as long as the pointer.
+ 
+ namespace nucleus {
+ namespace internal {
+ 
+-inline const google::protobuf::python::PyProto_API* GetPyProtoApi() {
+-  PYBIND11_CONSTINIT static pybind11::gil_safe_call_once_and_store<
+-      const google::protobuf::python::PyProto_API*>
+-      storage;
+-  return storage
+-      .call_once_and_store_result([]() {
+-        auto* ptr = static_cast<const google::protobuf::python::PyProto_API*>(
+-            PyCapsule_Import(google::protobuf::python::PyProtoAPICapsuleName(), 0));
+-        if (ptr == nullptr) {
+-          pybind11::raise_from(PyExc_RuntimeError,
+-                               "nucleus::internal::GetPyProtoApi() failed.");
+-          throw pybind11::error_already_set();
+-        }
+-        return ptr;
+-      })
+-      .get_stored();
+-}
+-
+-inline bool handle_get_message_pointer_errors(const google::protobuf::Message* cpb) {
+-  if (cpb == nullptr) {
+-    ABSL_CHECK(PyErr_Occurred());
+-    if (PyErr_ExceptionMatches(PyExc_TypeError)) {
+-      PyErr_Clear();
+-      return false;
+-    }
+-    throw pybind11::error_already_set();
+-  }
+-  if (PyErr_Occurred()) {
+-    ABSL_LOG(ERROR) << "UNEXPECTED Python error!";
+-    throw pybind11::error_already_set();
+-  }
+-  return true;
++// Copies a Python proto into `dst` if it holds the same message type.
++inline bool CopyFromPython(pybind11::handle src, google::protobuf::Message* dst) {
++  if (!pybind11::hasattr(src, "DESCRIPTOR") || !pybind11::hasattr(src, "SerializeToString"))
++    return false;
++  std::string name = pybind11::str(src.attr("DESCRIPTOR").attr("full_name"));
++  if (name != dst->GetDescriptor()->full_name()) return false;
++  std::string bytes = pybind11::bytes(src.attr("SerializeToString")());
++  return dst->ParseFromString(bytes);
+ }
+ 
+ template <typename ProtoPtrT>
+@@ -100,13 +82,25 @@ class type_caster_empty_proto_ptr
+ 
+   // Python to C++ conversion.
+   bool load(pybind11::handle src, bool /*convert*/) {
+-    auto* py_proto_api = GetPyProtoApi();
+-    google::protobuf::Message* cpb = py_proto_api->GetMutableMessagePointer(src.ptr());
+-    if (!handle_get_message_pointer_errors(cpb)) {
+-      return false;
+-    }
+-    this->proto_ptr.p_ = dynamic_cast<T*>(cpb);
+-    return (this->proto_ptr.p_ != nullptr);
++    auto copy = std::make_unique<T>();
++    if (!CopyFromPython(src, copy.get())) return false;
++    PyObject* py = src.ptr();
++    Py_INCREF(py);
++    // Runs when the last EmptyProtoPtr copy goes away: write the C++ result back to Python.
++    std::shared_ptr<T> owned(copy.release(), [py](T* msg) {
++      pybind11::gil_scoped_acquire gil;
++      std::string bytes;
++      msg->SerializeToString(&bytes);
++      PyObject* r = PyObject_CallMethod(py, "ParseFromString", "y#", bytes.data(),
++                                        static_cast<Py_ssize_t>(bytes.size()));
++      if (r == nullptr) PyErr_WriteUnraisable(py);
++      Py_XDECREF(r);
++      Py_DECREF(py);
++      delete msg;
++    });
++    this->proto_ptr.p_ = owned.get();
++    this->proto_ptr.keep_alive_ = std::move(owned);
++    return true;
+   }
+ };
+ 
+@@ -118,13 +112,11 @@ class type_caster_const_proto_ptr
+ 
+   // Python to C++ conversion.
+   bool load(pybind11::handle src, bool /*convert*/) {
+-    auto* py_proto_api = GetPyProtoApi();
+-    const google::protobuf::Message* cpb = py_proto_api->GetMessagePointer(src.ptr());
+-    if (!handle_get_message_pointer_errors(cpb)) {
+-      return false;
+-    }
+-    this->proto_ptr.p_ = dynamic_cast<const T*>(cpb);
+-    return (this->proto_ptr.p_ != nullptr);
++    auto owned = std::make_shared<std::remove_const_t<T>>();
++    if (!CopyFromPython(src, owned.get())) return false;
++    this->proto_ptr.p_ = owned.get();
++    this->proto_ptr.keep_alive_ = std::move(owned);
++    return true;
+   }
+ };
+ 

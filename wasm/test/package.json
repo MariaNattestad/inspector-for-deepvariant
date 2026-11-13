@@ -1,0 +1,10 @@
+{
+	"name": "inspector-for-deepvariant-tests",
+	"private": true,
+	"type": "module",
+	"description": "Headless runs of the browser pipeline (Pyodide + ONNX Runtime in Node), to compare with official DeepVariant output",
+	"dependencies": {
+		"onnxruntime-node": "1.22.0",
+		"pyodide": "314.0.7"
+	}
+}

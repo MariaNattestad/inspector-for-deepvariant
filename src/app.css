@@ -1,0 +1,46 @@
+/* Colors as tokens, light and dark (follows the system setting) */
+:root {
+	color-scheme: light dark;
+	--bg: #ffffff;
+	--bg-subtle: #f5f5f3;
+	--fg: #1d1d1f;
+	--fg-muted: #6e6e73;
+	--border: #e2e2df;
+	--accent: #2f6fdb;
+	--accent-subtle: #eaf1fd;
+	--ok: #1f8a4c;
+	--danger: #c5221f;
+	--warning: #e3a008;
+}
+@media (prefers-color-scheme: dark) {
+	:root {
+		--bg: #17181a;
+		--bg-subtle: #212327;
+		--fg: #e8e8ea;
+		--fg-muted: #9a9aa2;
+		--border: #34363b;
+		--accent: #6b9cf0;
+		--accent-subtle: #1e2a40;
+		--ok: #4cc27f;
+		--danger: #f07167;
+		--warning: #e8b23a;
+	}
+}
+*,
+*::before,
+*::after {
+	box-sizing: border-box;
+}
+html,
+body {
+	margin: 0;
+	background: var(--bg);
+	color: var(--fg);
+}
+a {
+	color: var(--accent);
+}
+code {
+	font-size: 0.92em;
+	color: var(--danger);
+}

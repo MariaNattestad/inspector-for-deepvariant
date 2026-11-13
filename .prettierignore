@@ -1,0 +1,6 @@
+dist
+public/deepvariant
+work
+wasm/build
+wasm/patches
+package-lock.json
