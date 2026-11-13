@@ -33,7 +33,8 @@ try {
 		phaseReads: ["pacbio", "ont_r104"].includes(key),
 		pangenome: pangenome ? `/in/${pangenome}` : undefined,
 		out: "/out",
-		phasedReads: process.env.PHASED ? "/out/phased" : undefined
+		phasedReads: process.env.PHASED ? "/out/phased" : undefined,
+		extraFlags: process.env.RUNTIME ? ["--runtime_by_region", "/out/runtime.tsv@1", ...(process.env.EXTRA ?? "").split(" ").filter(Boolean)] : undefined
 	});
 	console.log(`make_examples ${secs()} s`);
 	const n = await dv.callVariants(py, session, ort, { out: "/out" });
@@ -51,6 +52,7 @@ try {
 	process.exit(1);
 }
 fs.writeFileSync(outVcf, py.FS.readFile("/out/output.vcf.gz"));
+if (process.env.RUNTIME) fs.writeFileSync(process.env.RUNTIME, py.FS.readFile("/out/runtime.tsv-00000-of-00001"));
 if (process.env.PHASED)
 	fs.writeFileSync(outVcf.replace(/.vcf.gz$/, ".phased.bam"), py.FS.readFile("/out/phased-00000-of-00001.bam"));
 console.log(`wrote ${outVcf} (image shape ${info.shape})`);

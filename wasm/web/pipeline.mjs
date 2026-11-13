@@ -42,11 +42,12 @@ function runTool(py, tool, argv, { verbose = false, log = () => {} } = {}) {
 //   (see README: "Pangenome-aware DeepVariant")
 // phasedReads: a path prefix: also write the reads with DeepVariant's own phasing, which it sorts the pileup
 //   rows by (long-read models; --output_local_read_phasing), to <phasedReads>-00000-of-00001.bam
+// extraFlags: more make_examples flags (e.g. --runtime_by_region for timings)
 // realignerDir: also write the reads after local realignment (what the pileup images are made from), one
 // BAM per ~1 kb window: <realignerDir>/<window>/realigned_reads.bam. Only short-read models realign.
 export function makeExamples(
 	py,
-	{ ref, reads, regions, checkpoint, smallModel, phaseReads, pangenome, out, phasedReads, realignerDir, verbose, log }
+	{ ref, reads, regions, checkpoint, smallModel, phaseReads, pangenome, out, phasedReads, realignerDir, verbose, log, extraFlags }
 ) {
 	const argv = [
 		"--mode",
@@ -72,7 +73,8 @@ export function makeExamples(
 		"--hts_block_size",
 		"0",
 		...(realignerDir ? ["--realigner_diagnostics", realignerDir, "--emit_realigned_reads"] : []),
-		...(verbose ? [...VERBOSE, "--logging_every_n_candidates", "10"] : [])
+		...(verbose ? [...VERBOSE, "--logging_every_n_candidates", "10"] : []),
+		...(extraFlags ?? [])
 	];
 	runTool(py, pangenome ? "make_examples_pangenome_aware_dv" : "make_examples", argv, { verbose, log });
 }
