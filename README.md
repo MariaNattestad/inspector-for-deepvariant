@@ -17,6 +17,11 @@ This is an independent tool, not made by or affiliated with the DeepVariant team
 
 ## Your data
 
+Only the reads are required. Without a position, the app reads the BAM's header and index to find where the
+reads are and runs there: on the first low-GQ call (or no-call, or 1/2) of your VCF among the reads, if you gave
+one; otherwise in the middle of a snippet BAM, or where a whole-genome BAM's reads start. The reference (GRCh38 or
+GRCh37) is detected from the header's contig lengths.
+
 Reads can be a local BAM of any size (with its index): it's read from disk on demand, so only the locus is read.
 Or a URL, read with HTTP range requests, so only the locus is downloaded. The server has to allow requests from
 other sites (CORS); for a bucket, a rule like this:

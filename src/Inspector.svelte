@@ -9,6 +9,7 @@ import { onDestroy, onMount, tick } from "svelte";
 import Aioli from "@biowasm/aioli";
 import { CHANNELS, MODELS, exampleRegion, modelByKey, partitionsAround } from "./models.js";
 import { GQ_LOW, LIST_MAX, recordsIn, scanVcf, vcfFile } from "./vcf.js";
+import { guessReference, locateReads } from "./bam.js";
 
 // DeepVariant for the browser (wasm/build.sh or `npm run assets`), served with the app
 const URL_DEEPVARIANT = new URL(`${import.meta.env.BASE_URL}deepvariant/1.10.0`, location.href).href;
@@ -34,7 +35,9 @@ let indexUrl = $state(""); // its index ("" = the BAM's URL + .bai)
 let pangenomeFiles = $state([]);
 let captureText = $state(""); // WES capture BED, to run on whole capture intervals
 let referenceKey = $state("hg38");
-let regionText = $state("");
+let regionText = $state(""); // "" = pick one where the reads are
+let readsSpan = $state(null); // where your reads are: {contigs, chrom, start, end} | {error}
+let referenceDetected = $state(false);
 
 // Your DeepVariant VCF
 let vcfInput = $state(null); // File
@@ -76,7 +79,47 @@ const reference = $derived(REFERENCES[source === "example" ? EXAMPLE_REFERENCE :
 const reads = $derived(readsFrom === "url" ? pickUrl(readsUrl, indexUrl) : pickBam(files, "reads"));
 const pangenomeReads = $derived(pickBam(pangenomeFiles, "pangenome"));
 const capture = $derived(parseBed(captureText));
-const region = $derived(regionToRun(regionText, model, source === "upload" ? capture : []));
+// No position given: one where your reads are (and, with your VCF, a call worth a look)
+const autoPosition = $derived.by(() => {
+	if (source !== "upload" || !readsSpan?.chrom) return null;
+	const { chrom, start, end } = readsSpan;
+	if (vcfScan)
+		for (const key of ["lowGq", "noCall", "hetAlt"]) {
+			const r = vcfScan.lists[key].find((r) => r.chrom === chrom && r.pos >= start && r.pos <= end);
+			if (r) return { text: `${chrom}:${r.pos}`, about: `the first of your VCF's ${LISTS[key].name} among your reads` };
+		}
+	const small = end - start < 10e6; // a snippet: its middle; a whole genome: where its reads start
+	const at = small ? Math.round((start + end) / 2) : start;
+	// Short reads: about 10 kb, so there's likely something to call; long reads' 25 kb partition is enough
+	const text = model.partitionSize < 10000 ? `${chrom}:${Math.max(1, at - 5000)}-${at + 5000}` : `${chrom}:${at}`;
+	return { text, about: small ? "the middle of your reads" : "where your reads start" };
+});
+const region = $derived.by(() => {
+	if (regionText.trim() || source === "example") return regionToRun(regionText, model, source === "upload" ? capture : []);
+	if (autoPosition) return { ...regionToRun(autoPosition.text, model, capture), auto: autoPosition.about };
+	if (readsSpan?.error || readsSpan?.contigs) return { error: "Enter a position: couldn't find where your reads are." };
+	return { pending: true }; // found when you run (a small BAM without an index is sorted and indexed first)
+});
+
+// Where your reads are, read from the BAM's header and index as soon as you pick them
+$effect(() => {
+	const r = reads;
+	readsSpan = null;
+	const bam = r.url ?? r.alignments;
+	if (source !== "upload" || r.error || !bam || !r.index) return;
+	let current = true;
+	locateReads(bam, r.index).then(
+		(span) => current && found(span),
+		(e) => current && (readsSpan = { error: e.message ?? String(e) })
+	);
+	return () => (current = false);
+});
+function found(span) {
+	readsSpan = span;
+	const guess = guessReference(span.contigs);
+	referenceDetected = Boolean(guess);
+	if (guess) referenceKey = guess;
+}
 const canRun = $derived(
 	ready &&
 		!busy &&
@@ -110,7 +153,8 @@ function regionToRun(text, model, capture) {
 		runStart: run.start,
 		runEnd: run.end,
 		why,
-		position: !m[3]
+		position: !m[3],
+		input: text.replace(/\s/g, "")
 	};
 }
 
@@ -241,6 +285,11 @@ async function runDeepVariant() {
 		} else {
 			busy = "Downloading the example reads…";
 			[input, pangenome] = await Promise.all([fetchBam(model.bam), model.pangenome ? fetchBam(model.pangenomeBam) : null]);
+		}
+		if (region.pending) {
+			busy = "Finding where your reads are…";
+			found(await locateReads(input.bam, input.index));
+			if (region.error) throw new Error(region.error);
 		}
 		busy = `Running DeepVariant (${model.modelType} model)…`;
 		ranRegion = region.text;
@@ -448,7 +497,7 @@ function updateUrl() {
 	const params = new URLSearchParams({ model: model.key });
 	if (source === "example") params.set("example", String(exampleIndex + 1));
 	else {
-		params.set("region", regionText.replace(/\s/g, ""));
+		if (region.input) params.set("region", region.input);
 		if (readsFrom === "url" && reads.url) {
 			params.set("reads", reads.url);
 			if (indexUrl.trim()) params.set("index", indexUrl.trim());
@@ -474,6 +523,8 @@ function pickExample(i) {
 	regionText = exampleRegion(model, model.examples[i]);
 }
 function pickSource(value) {
+	// The example's position isn't yours: leave it empty, to use where your reads are
+	if (value === "upload" && regionText === exampleRegion(model, example)) regionText = "";
 	source = value;
 	if (value === "example") pickExample(exampleIndex);
 }
@@ -481,9 +532,9 @@ function pickSource(value) {
 onMount(() => {
 	const params = new URLSearchParams(location.search);
 	if (modelByKey(params.get("model"))) modelKey = params.get("model");
-	if (params.get("region")) {
+	if (params.has("region") || params.has("reads")) {
 		source = "upload";
-		regionText = params.get("region");
+		regionText = params.get("region") ?? "";
 		if (params.get("reads")) {
 			readsFrom = "url";
 			readsUrl = params.get("reads");
@@ -518,9 +569,10 @@ onDestroy(() => {
 	if (igvBrowser) igvModule.removeBrowser(igvBrowser);
 });
 
+// Names while waiting or running, and once done
 const STEP_NAMES = {
-	python: "Loading Python",
-	models: "Downloading model",
+	python: ["Loading Python", "Loaded Python"],
+	models: ["Downloading model", "Downloaded model"],
 	make_examples: "make_examples",
 	call_variants: "call_variants",
 	postprocess_variants: "postprocess_variants"
@@ -593,6 +645,7 @@ const pct = (a, b) => (b ? `${((100 * a) / b).toFixed(1)}%` : "–");
 				>
 				{#if source === "upload"}
 					<div class="indent uploads">
+						<p class="hint only-reads">Only the reads are needed. Everything else, position included, is optional.</p>
 						<span class="field">Reads</span>
 						<div class="choice">
 							<label><input type="radio" name="dvi-reads-from" value="file" bind:group={readsFrom} /> From your computer</label>
@@ -628,6 +681,15 @@ const pct = (a, b) => (b ? `${((100 * a) / b).toFixed(1)}%` : "–");
 								{:else}Read with range requests, so only the locus is downloaded, whatever the BAM's size. The server must allow
 									range requests and requests from other sites (CORS): S3 and GCS buckets need a CORS rule allowing GET and HEAD.{/if}
 							</div>
+						{/if}
+						{#if readsSpan?.error}
+							<div class="hint bad">
+								Couldn't read the BAM's header and index: {readsSpan.error}{readsFrom === "url" && /fetch/i.test(readsSpan.error)
+									? " (does the server allow requests from other sites, CORS?)"
+									: ""}
+							</div>
+						{:else if readsSpan?.chrom}
+							<div class="hint">Reads start at {readsSpan.chrom}:{fmt(readsSpan.start)}.</div>
 						{/if}
 						{#if model.pangenome}
 							<label class="field mt-s" for="dvi-pangenome">Pangenome haplotypes <span class="hint">(.bam + .bai)</span></label>
@@ -688,13 +750,26 @@ const pct = (a, b) => (b ? `${((100 * a) / b).toFixed(1)}%` : "–");
 						<option value={key}>{ref.name}</option>
 					{/each}
 				</select>
-				<div class="hint">Contig names must match your BAM (chr1, not 1). Only the region's sequence is downloaded.</div>
+				<div class="hint">
+					{#if source === "upload" && referenceDetected && readsSpan?.contigs}Detected from your BAM's header.{:else}Contig names
+						must match your BAM (chr1, not 1).{/if} Only the region's sequence is downloaded.
+				</div>
 
-				<label class="field mt" for="dvi-region"><span class="step-num">3</span> Position</label>
-				<input id="dvi-region" type="text" bind:value={regionText} disabled={source === "example"} />
+				<label class="field mt" for="dvi-region"
+					>Position{#if source === "upload"}&nbsp;<span class="hint">(optional)</span>{/if}</label
+				>
+				<input
+					id="dvi-region"
+					type="text"
+					bind:value={regionText}
+					disabled={source === "example"}
+					placeholder={autoPosition ? autoPosition.text.replace(/\d+/g, (n) => fmt(Number(n))) : "Empty: where your reads are"}
+				/>
 				<div class="hint" class:bad={region.error}>
 					{#if region.error}{region.error}
-					{:else}Runs on {region.text}: {region.why}, so the calls match a real run's.{/if}
+					{:else if region.pending}Leave it empty to run where your reads are, or enter a position like chr20:26,263,468.
+					{:else}{#if region.auto}No position given, so {region.auto}.{/if} Runs on {region.text}: {region.why}, so the
+						calls match a real run's.{/if}
 				</div>
 			</div>
 		</div>
@@ -704,7 +779,7 @@ const pct = (a, b) => (b ? `${((100 * a) / b).toFixed(1)}%` : "–");
 			>
 			<div class="steps">
 				{#each Object.entries(STEP_NAMES) as [key, label] (key)}
-					<span class="step {steps[key] ?? 'pending'}">{label}</span>
+					<span class="step {steps[key] ?? 'pending'}">{Array.isArray(label) ? label[steps[key] === "done" ? 1 : 0] : label}</span>
 				{/each}
 				{#if busy}<span class="hint">{busy}</span>{/if}
 			</div>
@@ -910,9 +985,6 @@ const pct = (a, b) => (b ? `${((100 * a) / b).toFixed(1)}%` : "–");
 				</div>
 			</div>
 
-			<h3 class="mt">In IGV</h3>
-			<div class="igv" bind:this={divIgv}></div>
-
 			<h3 class="mt">Pileup images</h3>
 			{#if selected.MID === "small_model"}
 				<p class="hint">None: the small model called this from summary features, so the CNN never looked at a pileup image.</p>
@@ -938,6 +1010,9 @@ const pct = (a, b) => (b ? `${((100 * a) / b).toFixed(1)}%` : "–");
 			{:else}
 				<p class="hint">Drawing pileup images…</p>
 			{/if}
+
+			<h3 class="mt">In IGV</h3>
+			<div class="igv" bind:this={divIgv}></div>
 		</section>
 	{/if}
 
@@ -1093,6 +1168,9 @@ select {
 input:disabled,
 select:disabled {
 	opacity: 0.7;
+}
+.only-reads {
+	margin: 0 0 0.5rem;
 }
 .hint {
 	color: var(--muted);
