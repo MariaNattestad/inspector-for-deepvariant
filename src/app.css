@@ -11,8 +11,8 @@
 	--ok: #1f8a4c;
 	--danger: #c5221f;
 	--warning: #b45309;
-	/* The one bright button: your own data */
-	--cta: #c2410c;
+	/* The one bright button: your own data (green) */
+	--cta: #15803d;
 	--cta-fg: #ffffff;
 	/* Read types, in the examples list */
 	--short-reads: #6a86d6;
@@ -39,7 +39,7 @@
 		--ok: #4cc27f;
 		--danger: #f07167;
 		--warning: #e8b23a;
-		--cta: #f08a4b;
+		--cta: #4ade80;
 		--cta-fg: #1d1d1f;
 		--short-reads: #7f9be6;
 		--long-reads: #e39a4f;

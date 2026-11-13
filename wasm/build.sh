@@ -32,6 +32,6 @@ echo "=== 3. Copy to $DIR_OUT"
 rm -rf "$DIR_OUT" && mkdir -p "$DIR_OUT/data" "$DIR_OUT/tools"
 cp "$DIR_SCRIPT/web/worker.mjs" "$DIR_SCRIPT/web/pipeline.mjs" "$DIR_BUILD/pysite.zip" "$DIR_OUT/"
 cp -R "$DIR_BUILD/models" "$DIR_OUT/"
-[ -d "$DIR_BUILD/examples" ] && cp "$DIR_BUILD"/examples/*.bam* "$DIR_OUT/data/"
+[ -d "$DIR_BUILD/examples" ] && cp "$DIR_BUILD"/examples/*.bam* "$DIR_BUILD"/examples/*.vcf.bgz "$DIR_OUT/data/"
 cp "$DIR_SCRIPT/tools/gbz_haplotypes_bam.py" "$DIR_OUT/tools/"
 du -ah "$DIR_OUT" | sort -k2

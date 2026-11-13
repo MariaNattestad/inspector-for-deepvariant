@@ -42,6 +42,12 @@ slice HG003.hybrid_pacbio_illumina.chr20.inspect_examples \
 	hybrid-case-study-testdata/HG003_hybrid_35x_ilmn_35x_pacb.grch38.phased.chr20.bam 4760752 4762753 \
 	8642752 8644753 9155818 9157819
 
+# DeepVariant's own calls for the whole-genome BAMs the page offers by URL: the official 1.10 case-study VCFs,
+# chr20 (.bgz: some servers would send .gz as Content-Encoding: gzip)
+for run in wgs/wgs pacbio/pacbio; do
+	tabix -h "$GCS/case-study-outputs/1.10.0/${run}_HG003.deepvariant.vcf.gz" chr20 | bgzip > "HG003.${run#*/}.chr20.deepvariant.vcf.bgz"
+done
+
 # Pangenome-aware: HPRC v1.1's haplotypes around the two WGS sites it gets right, as a BAM
 # (tools/gbz_haplotypes_bam.py; graph: $GCS/pangenome-case-study-testdata/hprc-v1.1-mc-grch38.gbz.db)
 DB=${1:-}

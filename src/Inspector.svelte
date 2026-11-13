@@ -99,6 +99,7 @@ let tab = $state("calls"); // under the selected call: "calls" (all calls in the
 let baseView = $state(null); // the selected call's alleles, base by base (alleles.js), or {error}
 let pileupIndex = $state(0); // which of the selected call's pileup images is shown
 let openModel = $state("wgs"); // the model open in the examples list
+let hasRun = $state(false); // your data: a run has started (then the inputs fold into one line)
 let editing = $state(true); // your data: the inputs are shown in full (else, after a run, as one line)
 let queued = false; // an example picked while another runs: run it next
 // {model, reference, reads: {bam, index}, pangenome?, example?, position, realigned: [...], phased?: File,
@@ -337,6 +338,7 @@ async function runDeepVariant() {
 	}
 	error = "";
 	editing = false;
+	hasRun = source === "upload";
 	finished = false;
 	calls = [];
 	selected = null;
@@ -669,6 +671,19 @@ function clearResults() {
 	if (igvBrowser) igvModule.removeBrowser(igvBrowser);
 	igvBrowser = null;
 }
+// DeepVariant's own calls for those BAMs (the official 1.10 case-study VCFs, chr20), served with the app
+const EXAMPLE_VCFS = [
+	{ label: "Illumina WGS", size: "3.6 MB", path: "data/HG003.wgs.chr20.deepvariant.vcf.bgz" },
+	{ label: "PacBio HiFi", size: "4.1 MB", path: "data/HG003.pacbio.chr20.deepvariant.vcf.bgz" }
+];
+async function tryVcf(v) {
+	try {
+		await loadVcf(await fetchFile(v.path));
+	} catch (e) {
+		vcfError = e.message ?? String(e);
+	}
+}
+
 // A whole-genome BAM by URL, with its model and a position worth a look
 function tryBigBam(b) {
 	modelKey = b.model;
@@ -819,7 +834,7 @@ const fileName = (r) => (r.url ? r.url.split("/").pop().split("?")[0] : r.alignm
 <div class="dvi">
 	<!-- Your own data: the inputs, in full until a run, then as one line -->
 	{#if source === "upload"}
-		{#if editing || !finished}
+		{#if editing || !hasRun}
 			<section class="card setup" id="dvi-setup">
 				<button class="back" onclick={() => pickSource("example")}>← Back to the examples</button>
 				<h1>Inspect your own data</h1>
@@ -1007,6 +1022,14 @@ const fileName = (r) => (r.url ? r.url.split("/").pop().split("?")[0] : r.alignm
 									: ""}{vcfScan.sample ? ` · ${vcfScan.sample}` : ""}
 							{:else}A .vcf or .vcf.gz from DeepVariant.{/if}
 						</div>
+						<div class="try-urls">
+							<span class="hint">Try DeepVariant 1.10's official calls for those BAMs (HG003, chr20):</span>
+							{#each EXAMPLE_VCFS as v (v.path)}
+								<button class="chip" class:on={vcfInput?.name === v.path.split("/").pop()} onclick={() => tryVcf(v)}
+									>{v.label} <span class="count">{v.size}</span></button
+								>
+							{/each}
+						</div>
 						{#if model.captureRegions}
 							<label class="sublabel" for="dvi-capture"
 								>Capture BED <span class="hint">(optional, as given to --regions)</span></label
@@ -1048,11 +1071,24 @@ const fileName = (r) => (r.url ? r.url.split("/").pop().split("?")[0] : r.alignm
 			</section>
 		{:else}
 			<div class="summary-bar">
-				<span class="ok">✓ DeepVariant 1.10 ran</span>
-				<span><span class="muted">Model</span> {ranModel.name}</span>
+				{#if busy}
+					<div class="steps">
+						{#each Object.entries(STEP_NAMES) as [key, label] (key)}
+							<span class="step {steps[key] ?? 'pending'}"
+								>{Array.isArray(label) ? label[steps[key] === "done" ? 1 : 0] : label}</span
+							>
+						{/each}
+						<span class="hint">{busy}</span>
+					</div>
+				{:else if error}
+					<span class="bad">Failed: {error.replace(/^Error: /, "")}</span>
+				{:else}
+					<span class="ok">✓ DeepVariant 1.10 ran</span>
+				{/if}
+				<span><span class="muted">Model</span> {(ranModel ?? model).name}</span>
 				<span><span class="muted">Reads</span> <span class="mono">{fileName(reads)}</span></span>
 				<span><span class="muted">Ref</span> {reference.name}</span>
-				<span><span class="muted">Region</span> <span class="mono">{ranRegion}</span></span>
+				<span><span class="muted">Region</span> <span class="mono">{ranRegion || region.text || "–"}</span></span>
 				{#if vcfScan}<span><span class="muted">VCF</span> <span class="mono">{vcfInput.name}</span></span>{/if}
 				<button class="link push" onclick={() => (editing = true)}>Change inputs</button>
 			</div>
@@ -1836,7 +1872,12 @@ button.run:disabled {
 	border-color: var(--error);
 	color: var(--error);
 }
+/* Pinned to the top, so a run's progress stays in view while you pick calls further down */
 .summary-bar {
+	position: sticky;
+	top: 8px;
+	z-index: 5;
+	box-shadow: 0 2px 8px rgb(0 0 0 / 0.08);
 	display: flex;
 	flex-wrap: wrap;
 	align-items: center;
