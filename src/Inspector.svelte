@@ -532,8 +532,9 @@ async function select(call) {
 // DeepVariant used: the reads after its local realignment (short reads), the reads with its own phasing,
 // grouped by haplotype (long reads), and the pangenome's haplotypes (pangenome-aware)
 const NAME_REALIGNED = "Realigned by DeepVariant (what it saw)";
-// Read tracks with every base as a letter (IGV draws letters at 10+ px per base, in rows 10+ px tall)
-const IGV_READS = { height: 230, coverageTrackHeight: 24, alignmentRowHeight: 11, showAllBases: true };
+// Read tracks with mismatched bases as letters: IGV draws letters at 10+ px per base, in rows 10+ px tall, so the
+// view is zoomed in and rows are 11 px
+const IGV_READS = { height: 230, coverageTrackHeight: 24, alignmentRowHeight: 11 };
 async function showInIgv(locus, realigned) {
 	const realignedTrack = realigned && {
 		name: NAME_REALIGNED,
