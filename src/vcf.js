@@ -11,6 +11,14 @@ const TEXT_BLOCK = 1024 * 1024; // block size for uncompressed VCFs
 export const LIST_MAX = 100000; // calls kept per list
 export const GQ_LOW = 20;
 
+// A macrotask turn, so the page can draw and handle input; a message, since background tabs slow timers down
+const yieldToPage = () =>
+	new Promise((resolve) => {
+		const channel = new MessageChannel();
+		channel.port1.onmessage = () => resolve();
+		channel.port2.postMessage(null);
+	});
+
 // The blocks of a BGZF file: [{offset, size}] (compressed offsets), from each block's BSIZE field
 async function bgzfBlocks(file, onProgress) {
 	const blocks = [];
@@ -157,7 +165,7 @@ export async function scanVcf(file, onProgress) {
 		});
 		onProgress?.((compressed ? 0.5 : 0) + ((i + 64) / blocks.length) * (compressed ? 0.5 : 1));
 		// Let the page draw the progress (and stay responsive): decompressing and parsing never yield otherwise
-		await new Promise((resolve) => setTimeout(resolve));
+		await yieldToPage();
 	}
 	handle(rest, blocks.length - 1);
 	if (!header.some((l) => l.startsWith("#CHROM"))) throw new Error("That doesn't look like a VCF: there's no #CHROM line.");

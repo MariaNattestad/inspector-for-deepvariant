@@ -66,12 +66,12 @@ let pangenomeFiles = $state([]);
 let captureText = $state(""); // WES capture BED, to run on whole capture intervals
 let referenceKey = $state("hg38");
 let regionText = $state(""); // "" = pick one where the reads are
-let readsSpan = $state(null); // where your reads are: {contigs, chrom, start, end} | {error}
+let readsSpan = $state.raw(null); // where your reads are: {contigs, chrom, start, end} | {error}
 let referenceDetected = $state(false);
 
 // Your DeepVariant VCF
 let vcfInput = $state(null); // File
-let vcfScan = $state(null);
+let vcfScan = $state.raw(null); // read once and never changed: raw, so its 100,000s of records aren't made reactive
 let vcfProgress = $state(0);
 let vcfError = $state("");
 let listKey = $state("lowGq");
@@ -89,7 +89,7 @@ let finished = $state(false);
 let ranRegion = $state("");
 let ranModel = $state(null);
 let calls = $state([]); // VCF records of this run, each with .yours: the matching record of your VCF, if any
-let yourRecords = $state(null); // your VCF's records in the region (null: no VCF)
+let yourRecords = $state.raw(null); // your VCF's records in the region (null: no VCF)
 let selected = $state(null);
 let pileupsForSelected = $state([]);
 let pileupError = $state("");
@@ -400,6 +400,11 @@ function onDone({ vcfLines, vcfText, realignedReads, phasedReads }) {
 		queued = false;
 		busy = "";
 		runDeepVariant();
+		return;
+	}
+	// You switched between the examples and your data while it ran: its results aren't for this view
+	if (Boolean(run?.example) !== (source === "example")) {
+		busy = "";
 		return;
 	}
 	const header = vcfLines[0].replace(/^#/, "").split("\t");
