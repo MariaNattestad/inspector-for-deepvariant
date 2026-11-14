@@ -293,16 +293,20 @@ const fetchBam = async (path) => {
 // ---------------------------------------------------------------------------------------------------------
 // Your DeepVariant VCF
 // ---------------------------------------------------------------------------------------------------------
+// Only the latest load counts: picking another VCF while one is read drops the first
+let vcfLoad = 0;
 async function loadVcf(file) {
+	const load = ++vcfLoad;
 	vcfInput = file;
 	vcfScan = null;
 	vcfError = "";
 	vcfProgress = 0;
 	if (!file) return;
 	try {
-		vcfScan = await scanVcf(file, (p) => (vcfProgress = p));
+		const scan = await scanVcf(file, (p) => load === vcfLoad && (vcfProgress = p));
+		if (load === vcfLoad) vcfScan = scan;
 	} catch (e) {
-		vcfError = e.message ?? String(e);
+		if (load === vcfLoad) vcfError = e.message ?? String(e);
 	}
 }
 
@@ -678,12 +682,19 @@ const EXAMPLE_VCFS = [
 	{ label: "PacBio HiFi", size: "4.1 MB", path: "data/HG003.pacbio.chr20.deepvariant.vcf.bgz" }
 ];
 async function tryVcf(v) {
+	// Shown at once, while it downloads
+	const name = v.path.split("/").pop();
+	vcfInput = { name };
+	vcfScan = null;
+	vcfError = "";
+	vcfProgress = 0;
 	try {
 		await loadVcf(await fetchFile(v.path));
 	} catch (e) {
 		vcfError = e.message ?? String(e);
 	}
 }
+const vcfBusy = $derived(Boolean(vcfInput && !vcfScan && !vcfError));
 
 // A whole-genome BAM by URL, with its model and a position worth a look
 function tryBigBam(b) {
@@ -1026,8 +1037,11 @@ const fileName = (r) => (r.url ? r.url.split("/").pop().split("?")[0] : r.alignm
 						<div class="try-urls">
 							<span class="hint">Try DeepVariant 1.10's official calls for those BAMs (HG003, chr20):</span>
 							{#each EXAMPLE_VCFS as v (v.path)}
-								<button class="chip" class:on={vcfInput?.name === v.path.split("/").pop()} onclick={() => tryVcf(v)}
-									>{v.label} <span class="count">{v.size}</span></button
+								<button
+									class="chip"
+									class:on={vcfInput?.name === v.path.split("/").pop()}
+									disabled={vcfBusy}
+									onclick={() => tryVcf(v)}>{v.label} <span class="count">{v.size}</span></button
 								>
 							{/each}
 						</div>
@@ -2088,6 +2102,10 @@ button.run:disabled {
 	background: var(--fg);
 	border-color: var(--fg);
 	color: var(--bg);
+}
+.chip:disabled {
+	opacity: 0.55;
+	cursor: progress;
 }
 .chip .count {
 	margin-left: 4px;

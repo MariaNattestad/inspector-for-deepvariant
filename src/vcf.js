@@ -156,6 +156,8 @@ export async function scanVcf(file, onProgress) {
 			for (const line of lines) handle(line, i + j);
 		});
 		onProgress?.((compressed ? 0.5 : 0) + ((i + 64) / blocks.length) * (compressed ? 0.5 : 1));
+		// Let the page draw the progress (and stay responsive): decompressing and parsing never yield otherwise
+		await new Promise((resolve) => setTimeout(resolve));
 	}
 	handle(rest, blocks.length - 1);
 	if (!header.some((l) => l.startsWith("#CHROM"))) throw new Error("That doesn't look like a VCF: there's no #CHROM line.");
