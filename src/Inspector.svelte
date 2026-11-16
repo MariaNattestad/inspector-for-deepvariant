@@ -120,6 +120,7 @@ let listSort = $state("pos"); // "pos" | "gq": lowest GQ first
 // {model, reference, reads: {bam, index}, pangenome?, example?, position, realigned: [...], phased?: File,
 //  vcfFile, yourVcf?: File, pileups: Promise}
 let run = null;
+let awaitingPileups = []; // show_examples requests not answered yet: [{pending: {resolve, reject}, model}]
 
 let worker, igvBrowser, igvModule, samtools;
 let divIgv = $state();
@@ -519,8 +520,11 @@ function onDone({ vcfLines, vcfText, realignedReads, phasedReads, alleleCounts: 
 	// Only CNN calls have one: the small model's calls never become pileup images.
 	run.pileups = new Promise((resolve, reject) => (run.pileupsPending = { resolve, reject }));
 	run.pileups.catch(() => {});
-	if (calls.some((c) => c.MID !== "small_model")) worker.postMessage({ cmd: "show_examples" });
-	else run.pileupsPending.resolve([]);
+	if (calls.some((c) => c.MID !== "small_model")) {
+		// Answered in order, possibly after the next run has started (run is then another run's)
+		awaitingPileups.push({ pending: run.pileupsPending, model: run.model });
+		worker.postMessage({ cmd: "show_examples" });
+	} else run.pileupsPending.resolve([]);
 	busy = "";
 	finished = true;
 	alleleCounts = counts ?? null;
@@ -1089,7 +1093,7 @@ onMount(() => {
 			}
 		} else if (m.type === "done") onDone(m);
 		else if (m.type === "pileups") {
-			const { pileupsPending, model: ranWith } = run;
+			const { pending: pileupsPending, model: ranWith } = awaitingPileups.shift();
 			Promise.all(
 				m.images.map(async ({ name, bytes }) => {
 					const url = URL.createObjectURL(new Blob([bytes], { type: "image/png" }));
@@ -1098,7 +1102,7 @@ onMount(() => {
 				})
 			).then(pileupsPending.resolve, pileupsPending.reject);
 		} else if (m.type === "error") {
-			if (run?.pileupsPending && calls.length) run.pileupsPending.reject(new Error(m.text));
+			if (awaitingPileups.length && calls.length) awaitingPileups.shift().pending.reject(new Error(m.text));
 			else error = m.text;
 			busy = "";
 			if (queued) {
