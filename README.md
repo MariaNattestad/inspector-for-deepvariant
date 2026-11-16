@@ -13,6 +13,13 @@ and compares each rerun call with yours. Your files stay on your computer: nothi
 - **Faithful:** it runs DeepVariant's own Python and C++ (compiled to WebAssembly), not a rewrite, and gives
   the official case studies' genotypes for every model (`wasm/README.md`, "Reproducing a real run").
 
+- **No call where you expected one:** enter the position, and the page shows what DeepVariant counted there
+  (each allele's reads against the thresholds a candidate has to pass) and lets you force that candidate
+  (`--variant_caller=vcf_candidate_importer`), to see its pileup image and what the CNN makes of it. A
+  small-model call can be rerun through the CNN the same way.
+- **Share a locus:** "Download this locus" saves one `.zip` with the reads at the locus, the calls, the reads
+  as DeepVariant saw them and the pileup images, made in the browser. Pick that `.zip` as the reads to open it.
+
 This is an independent tool, not made by or affiliated with the DeepVariant team at Google.
 
 ## Your data
@@ -20,7 +27,8 @@ This is an independent tool, not made by or affiliated with the DeepVariant team
 Only the reads are required. Without a position, the app reads the BAM's header and index to find where the
 reads are and runs there: on the first low-GQ call (or no-call, or 1/2) of your VCF among the reads, if you gave
 one; otherwise in the middle of a snippet BAM, or where a whole-genome BAM's reads start. The reference (GRCh38 or
-GRCh37) is detected from the header's contig lengths.
+GRCh37) is detected from the header's contig lengths, with contigs named `chr1` or `1` (b37, hs37d5). CRAM isn't
+read (decoding it needs the reference's sequence): cut a BAM of the locus with `samtools view -b -T`.
 
 Reads can be a local BAM of any size (with its index): it's read from disk on demand, so only the locus is read.
 Or a URL, read with HTTP range requests, so only the locus is downloaded. The server has to allow requests from
@@ -53,6 +61,7 @@ npm run dev
 | `src/Inspector.svelte`                    | The app                                                                                                 |
 | `src/models.js`                           | The models, their pileup channels, and the examples                                                     |
 | `src/vcf.js`                              | Reads a DeepVariant VCF in the browser, without an index                                                |
+| `src/bundle.js`                           | A locus as one `.zip`, written and read in the browser                                                  |
 | `wasm/`                                   | DeepVariant for the browser: build, worker (`wasm/web/`), model conversion, tests. See `wasm/README.md` |
 | `public/deepvariant/1.10.0/` (gitignored) | What `wasm/build.sh` makes, or `npm run assets` downloads                                               |
 | `work/` (gitignored)                      | Large working files (below)                                                                             |

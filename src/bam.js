@@ -155,3 +155,20 @@ export function guessReference(contigs) {
 	if (chr20?.length === 63025520) return "hg19";
 	return null;
 }
+
+// The reference's .fai with its contigs named as the BAM's, where they're the same contig under another name
+// (same length; 1 for chr1, MT for chrM): the FASTA's bytes are found through the .fai, so a BAM aligned to the
+// same assembly with other contig names can use the same FASTA. Returns {text, renamed: how many}.
+const bare = (name) => name.replace(/^chr/i, "").replace(/^MT$/i, "M");
+export function aliasFai(text, contigs) {
+	const names = new Map(contigs.map((c) => [`${bare(c.name)} ${c.length}`, c.name]));
+	let renamed = 0;
+	const lines = text.split("\n").map((line) => {
+		const f = line.split("\t");
+		const name = f.length >= 5 ? names.get(`${bare(f[0])} ${f[1]}`) : null;
+		if (!name || name === f[0]) return line;
+		renamed++;
+		return [name, ...f.slice(1)].join("\t");
+	});
+	return { text: lines.join("\n"), renamed };
+}

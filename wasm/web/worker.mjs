@@ -5,12 +5,17 @@
 //
 // To the worker:   {cmd: "run", region: "chr:start-end", bam: File | URL, index: File | URL,
 //                   reference: {fasta: URL, fai: URL}, verbose?: bool, realigned?: bool,
-//                   model?: "wgs" | "wes" | "pacbio" | ..., pangenome?: File, pangenomeIndex?: File}
+//                   model?: "wgs" | "wes" | "pacbio" | ..., pangenome?: File, pangenomeIndex?: File,
+//                   watch?: {chrom, pos}, cnnOnly?: bool, force?: [{chrom, pos, ref, alt}]}
 //                  (bam: a local file, read from disk on demand, or a URL, read with range requests (the server
 //                   must allow both: CORS and Accept-Ranges), so only the locus is read, whatever the BAM's size;
 //                   reference: read on demand with range requests; realigned: also return the reads DeepVariant used: after local realignment for short-read
 //                   models, with its own phasing (HP tag) for long-read ones, which don't realign;
 //                   model: see MODELS, default "wgs"; pangenome: a BAM of pangenome haplotypes, for "wgs_pangenome")
+//                   watch: also return what DeepVariant counted at pos ± 10 bp (alleleCounts), to explain why
+//                   there is or isn't a candidate; cnnOnly: no small model, so the CNN calls every candidate;
+//                   force: consider only these candidates, whatever the reads show (make_examples
+//                   --variant_caller=vcf_candidate_importer), called by the CNN)
 //                  {cmd: "show_examples", verbose?: bool}   (after a run)
 // From the worker: {type: "log", text}
 //                  {type: "step", step: "python" | "models"                                     (setup, once)
@@ -18,7 +23,8 @@
 //                   state: "running" | "done" | "error", secs?, bytes?}       bytes: downloaded during the step
 //                  {type: "ready"}                       loading finished, runs can be sent
 //                  {type: "done", model, realigns, vcfLines, vcfText, vcfBytes, lazy,
-//                   realignedReads: [{window, bytes, changed, total}], phasedReads?: bytes}
+//                   realignedReads: [{window, bytes, changed, total}], phasedReads?: bytes,
+//                   alleleCounts?: {rows: [{pos, ref, refCount, alleles: [{type, bases, count}]}], thresholds}}
 //                  (realigns: whether the model realigns reads; phasedReads: long-read models' phased reads)
 //                  (changed: how many of the window's total reads realignment moved)
 //                  {type: "pileups", images: [{name, bytes}], secs}       show_examples' PNGs
@@ -225,13 +231,15 @@ async function useBam(py, dir, bam, index) {
 // FASTA, so htslib doesn't warn that the index is older). Set up once per URL.
 const references = {}; // FASTA URL -> path in Pyodide's filesystem
 async function useReference(py, { fasta, fai }) {
-	if (!references[fasta]) {
+	// (the same FASTA can come with another index: one whose contigs are named as the reads', 1 for chr1)
+	const key = `${fasta} ${fai}`;
+	if (!references[key]) {
 		const path = `/refs/${Object.keys(references).length}/${fasta.split("/").pop()}`;
 		await addLazyFile(py, path, fasta);
 		py.FS.writeFile(`${path}.fai`, await fetchBytes(fai));
-		references[fasta] = path;
+		references[key] = path;
 	}
-	return references[fasta];
+	return references[key];
 }
 
 const loaded = Promise.all([python, models]).then(([py]) => {
@@ -241,7 +249,20 @@ const loaded = Promise.all([python, models]).then(([py]) => {
 
 let runs = 0,
 	lastOut = null;
-async function run({ region, bam, index, verbose, reference, realigned, model: modelKey = "wgs", pangenome, pangenomeIndex }) {
+async function run({
+	region,
+	bam,
+	index,
+	verbose,
+	reference,
+	realigned,
+	model: modelKey = "wgs",
+	pangenome,
+	pangenomeIndex,
+	watch,
+	cnnOnly,
+	force
+}) {
 	const { py } = await loaded;
 	const model = await loadModel(modelKey);
 	if (model.pangenome && !pangenome) throw new Error("Pangenome-aware DeepVariant needs a pangenome: a BAM of haplotypes.");
@@ -253,13 +274,23 @@ async function run({ region, bam, index, verbose, reference, realigned, model: m
 	const pangenomePath = model.pangenome ? await useBam(py, `/user/${runs}-pangenome`, pangenome, pangenomeIndex) : undefined;
 	log(`\n=== DeepVariant (${modelKey.toUpperCase()} model) on ${region} (${typeof bam === "string" ? bam : bam.name}) ===`);
 
+	// Forced candidates are for the CNN: the point is to see its pileup image and what it makes of it
+	const smallModel = model.smallModel && !cnnOnly && !force?.length;
+	let proposed;
+	if (force?.length) {
+		proposed = `${out}/proposed.vcf.gz`;
+		dv.writeProposed(py, proposed, ref, force);
+		log(`Forced candidates: ${force.map((f) => `${f.chrom}:${f.pos} ${f.ref}>${f.alt}`).join(", ")}`);
+	}
+	dv.watchPosition(py, watch?.chrom, watch?.pos);
 	await step("make_examples", () =>
 		dv.makeExamples(py, {
 			ref,
 			reads,
 			regions: region,
 			checkpoint: model.checkpoint,
-			smallModel: model.smallModelPath,
+			smallModel: smallModel ? model.smallModelPath : undefined,
+			proposed,
 			phaseReads: model.phaseReads,
 			pangenome: pangenomePath,
 			out,
@@ -269,13 +300,15 @@ async function run({ region, bam, index, verbose, reference, realigned, model: m
 			log
 		})
 	);
+	const alleleCounts = watch ? dv.alleleCounts(py) : null;
+	dv.watchPosition(py);
 	await step("call_variants", () => dv.callVariants(py, model.session, ort, { out, log }));
 	await step("postprocess_variants", () =>
 		dv.postprocessVariants(py, {
 			ref,
 			regions: region,
 			checkpointJson: model.checkpointJson,
-			smallModel: model.smallModel,
+			smallModel,
 			out,
 			verbose,
 			log
@@ -338,7 +371,8 @@ _realigned_stats`
 			vcfBytes,
 			lazy: lazyBytes(),
 			realignedReads,
-			phasedReads
+			phasedReads,
+			alleleCounts
 		},
 		[vcfBytes.buffer, ...realignedReads.map((r) => r.bytes.buffer), ...(phasedReads ? [phasedReads.buffer] : [])]
 	);

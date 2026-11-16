@@ -18,7 +18,8 @@ import {
 	sameSiteElsewhere
 } from "./models.js";
 import { GQ_LOW, LIST_MAX, recordsIn, scanVcf, vcfFile } from "./vcf.js";
-import { guessReference, locateReads } from "./bam.js";
+import { aliasFai, guessReference, locateReads } from "./bam.js";
+import { makeZip, readZip } from "./bundle.js";
 import { alleleView, referenceSequence, windowAround } from "./alleles.js";
 
 // DeepVariant for the browser (wasm/build.sh or `npm run assets`), served with the app
@@ -31,6 +32,9 @@ const REFERENCES = {
 	hg19: { name: "GRCh37 / hg19", fasta: `${URL_IGV}/hg19/hg19.fasta`, fai: `${URL_IGV}/hg19/hg19.fasta.fai` }
 };
 const EXAMPLE_REFERENCE = "hg38"; // all examples are HG003 on GRCh38
+const DV_VERSION = "1.10.0"; // what this page runs
+// postprocess_variants --cnn_homref_call_min_gq: the CNN's reference calls with a lower GQ are written ./.
+const HOMREF_MIN_GQ = 20;
 const MAX_REGION = 200000; // bp: larger regions would take minutes in the browser
 // Whole-genome BAMs from DeepVariant's case studies, to try reads by URL: 42basepairs serves DeepVariant's
 // bucket with range requests and CORS (the bucket itself has no CORS)
@@ -102,6 +106,17 @@ let openModel = $state("wgs"); // the model open in the examples list
 let hasRun = $state(false); // your data: a run has started (then the inputs fold into one line)
 let editing = $state(true); // your data: the inputs are shown in full (else, after a run, as one line)
 let queued = false; // an example picked while another runs: run it next
+// What DeepVariant counted around the position you asked about: {rows, thresholds} (worker.mjs, watch)
+let alleleCounts = $state.raw(null);
+// No candidate where you asked: {chrom, pos, nearest: the closest calls, realigned: bool}
+let noCandidate = $state.raw(null);
+// How the last run differed from a normal one: {force?: [{chrom, pos, ref, alt}], cnnOnly?: bool,
+// before?: the small model's call that the CNN was asked about}
+let ranMode = $state.raw(null);
+let bundling = $state(""); // what "Download this locus" is doing, "" when idle
+let bundleError = $state("");
+let listType = $state("all"); // your VCF's lists: "all" | "snp" | "indel"
+let listSort = $state("pos"); // "pos" | "gq": lowest GQ first
 // {model, reference, reads: {bam, index}, pangenome?, example?, position, realigned: [...], phased?: File,
 //  vcfFile, yourVcf?: File, pileups: Promise}
 let run = null;
@@ -113,6 +128,27 @@ const model = $derived(modelByKey(modelKey));
 const examples = $derived(model.examples);
 const example = $derived(examples[Math.min(exampleIndex, examples.length - 1)]);
 const reference = $derived(REFERENCES[source === "example" ? EXAMPLE_REFERENCE : referenceKey]);
+// Your BAM's contigs named 1, 2, ... (b37, hs37d5, Ensembl) rather than chr1, chr2, ...
+const bareContigs = $derived(
+	Boolean(readsSpan?.contigs?.some((c) => c.name === "1" || c.name === "20") && !readsSpan.contigs.some((c) => c.name === "chr1"))
+);
+// The reference with its contigs named as your BAM's (see aliasFai): the same FASTA, read through a renamed .fai
+const aliased = new Map();
+async function referenceFor(key, contigs) {
+	const base = REFERENCES[key];
+	if (!contigs?.length) return base;
+	const id = `${key} ${contigs
+		.slice(0, 30)
+		.map((c) => c.name)
+		.join(",")}`;
+	if (!aliased.has(id)) {
+		const response = await fetch(base.fai);
+		if (!response.ok) throw new Error(`Couldn't read the reference's index: HTTP ${response.status}`);
+		const { text, renamed } = aliasFai(await response.text(), contigs);
+		aliased.set(id, renamed ? { ...base, fai: URL.createObjectURL(new Blob([text], { type: "text/plain" })) } : base);
+	}
+	return aliased.get(id);
+}
 const reads = $derived(readsFrom === "url" ? pickUrl(readsUrl, indexUrl) : pickBam(files, "reads"));
 const pangenomeReads = $derived(pickBam(pangenomeFiles, "pangenome"));
 const capture = $derived(parseBed(captureText));
@@ -232,7 +268,12 @@ function parseBed(text) {
 // A BAM with its index can be used as is, at any size: DeepVariant and IGV only read the locus. A small file
 // without an index (SAM, unsorted) is sorted and indexed first, in the browser; a large one needs its index.
 const MAX_UNINDEXED = 200e6; // bytes
+// CRAM needs the reference's sequence to decode, whole chromosomes of it: too much for the browser
+const CRAM_HELP =
+	"CRAM isn't read here: decoding it needs the reference's sequence. Make a BAM of the locus instead: samtools view -b -T reference.fa sample.cram chr20:1000000-1100000 > locus.bam";
 function pickBam(list, what) {
+	const cram = list.find((f) => /\.cram$/i.test(f.name));
+	if (cram) return { error: CRAM_HELP };
 	const alignments = list.find((f) => /\.(bam|sam)$/i.test(f.name));
 	const index = list.find((f) => /\.(bai|csi)$/i.test(f.name));
 	if (!alignments) return { error: `Pick the ${what} as a .bam or .sam file (and its .bai, if you have one).` };
@@ -253,6 +294,7 @@ function pickUrl(url, indexUrl) {
 	} catch {
 		return { error: "Enter the BAM's URL (https://…/sample.bam)." };
 	}
+	if (/\.cram$/i.test(parsed.pathname)) return { error: CRAM_HELP };
 	const index = indexUrl.trim() || `${parsed.origin}${parsed.pathname}.bai${parsed.search}`;
 	return { url: parsed.href, index };
 }
@@ -312,15 +354,28 @@ async function loadVcf(file) {
 
 const LISTS = {
 	lowGq: { name: `PASS with GQ < ${GQ_LOW}`, about: "Called, but not confidently" },
-	noCall: { name: "No-calls (./.)", about: "DeepVariant saw a candidate but couldn't decide the genotype" },
+	noCall: {
+		name: "No-calls (./.)",
+		about: `Mostly candidates the CNN thinks are reference, but with GQ under ${HOMREF_MIN_GQ}: written ./. instead of 0/0`
+	},
 	hetAlt: { name: "Two alternate alleles (1/2)", about: "Multiallelic calls, often in repeats" }
 };
 const listShown = $derived.by(() => {
-	if (!vcfScan) return [];
+	if (!vcfScan) return { total: 0, rows: [] };
 	const q = listFilter.replace(/[,\s]/g, "").toLowerCase();
-	const list = vcfScan.lists[listKey];
-	return (q ? list.filter((r) => `${r.chrom}:${r.pos}`.toLowerCase().includes(q)) : list).slice(0, 300);
+	let list = vcfScan.lists[listKey];
+	if (q) list = list.filter((r) => `${r.chrom}:${r.pos}`.toLowerCase().includes(q));
+	if (listType !== "all") list = list.filter((r) => isIndel(r) === (listType === "indel"));
+	if (listSort === "gq") list = list.toSorted((a, b) => Number(a.GQ) - Number(b.GQ));
+	return { total: list.length, rows: list.slice(0, 300) };
 });
+const isIndel = (r) => r.alt.split(",").some((a) => a !== "<*>" && a.length !== r.ref.length);
+// Your VCF's DeepVariant version, when it isn't the one this page runs (1.10.x)
+const otherVersion = $derived(
+	vcfScan?.version && vcfScan.version.split(".").slice(0, 2).join(".") !== DV_VERSION.split(".").slice(0, 2).join(".")
+		? vcfScan.version
+		: null
+);
 
 function inspectRecord(r) {
 	regionText = `${r.chrom}:${r.pos.toLocaleString("en-US")}`;
@@ -335,7 +390,9 @@ function inspectRecord(r) {
 // ---------------------------------------------------------------------------------------------------------
 // Running DeepVariant
 // ---------------------------------------------------------------------------------------------------------
-async function runDeepVariant() {
+// force: consider only these candidates ([{chrom, pos, ref, alt}]), whatever the reads show; cnnOnly: no small
+// model, so the CNN calls every candidate; before: the small model's call the CNN is asked about
+async function runDeepVariant({ force = null, cnnOnly = false, before = null } = {}) {
 	if (busy) {
 		queued = true;
 		return;
@@ -347,6 +404,9 @@ async function runDeepVariant() {
 	calls = [];
 	selected = null;
 	yourRecords = null;
+	alleleCounts = null;
+	noCandidate = null;
+	bundleError = "";
 	steps = { python: steps.python, models: steps.models }; // keep the setup steps' state
 	if (igvBrowser) igvModule.removeBrowser(igvBrowser);
 	igvBrowser = null;
@@ -361,26 +421,49 @@ async function runDeepVariant() {
 			busy = "Downloading the example reads…";
 			[input, pangenome] = await Promise.all([fetchBam(model.bam), model.pangenome ? fetchBam(model.pangenomeBam) : null]);
 		}
-		if (region.pending) {
+		// The BAM's contigs, for the position (if none was given) and the reference's contig names
+		if (source === "upload" && !readsSpan?.contigs) {
 			busy = "Finding where your reads are…";
-			found(await locateReads(input.bam, input.index));
-			if (region.error) throw new Error(region.error);
+			try {
+				found(await locateReads(input.bam, input.index));
+			} catch (e) {
+				if (region.pending) throw e;
+			}
 		}
+		if (region.error) throw new Error(region.error);
+		const ref = source === "upload" ? await referenceFor(referenceKey, readsSpan?.contigs) : reference;
 		busy = `Running DeepVariant (${model.modelType} model)…`;
 		ranRegion = region.text;
 		ranModel = model;
-		run = { model, reference, reads: input, pangenome, example: source === "example" ? example : null, position: region };
+		ranMode = force || cnnOnly ? { force, cnnOnly, before } : null;
+		// The position asked about: a forced candidate's, the example's, or the one you entered
+		const target = force?.[0].pos ?? before?.pos ?? (source === "example" ? example.pos : region.position ? region.start : null);
+		run = {
+			model,
+			reference: ref,
+			referenceKey: source === "example" ? EXAMPLE_REFERENCE : referenceKey,
+			reads: input,
+			pangenome,
+			example: source === "example" ? example : null,
+			position: region,
+			target,
+			force,
+			asked: Boolean(force || before) // a call or allele you asked about, even among the examples
+		};
 		updateUrl();
 		worker.postMessage({
 			cmd: "run",
 			region: region.text,
 			bam: input.bam,
 			index: input.index,
-			reference: { fasta: reference.fasta, fai: reference.fai },
+			reference: { fasta: ref.fasta, fai: ref.fai },
 			realigned: true,
 			model: model.key,
 			pangenome: pangenome?.bam,
-			pangenomeIndex: pangenome?.index
+			pangenomeIndex: pangenome?.index,
+			watch: target ? { chrom: region.chrom, pos: target } : undefined,
+			cnnOnly,
+			force: force ?? undefined
 		});
 		// Meanwhile, your VCF's records in the same region (a little wider, for IGV)
 		if (vcfScan && source === "upload") {
@@ -394,7 +477,7 @@ async function runDeepVariant() {
 	}
 }
 
-function onDone({ vcfLines, vcfText, realignedReads, phasedReads }) {
+function onDone({ vcfLines, vcfText, realignedReads, phasedReads, alleleCounts: counts }) {
 	// Another example was picked meanwhile: run that instead
 	if (queued) {
 		queued = false;
@@ -440,11 +523,112 @@ function onDone({ vcfLines, vcfText, realignedReads, phasedReads }) {
 	else run.pileupsPending.resolve([]);
 	busy = "";
 	finished = true;
-	// An example, or a position you entered: the call closest to it (an indel may be placed a few bp off)
-	const target = run.example?.pos ?? (run.position.position ? run.position.start : null);
+	alleleCounts = counts ?? null;
+	const target = run.target;
 	const near = (call) => Math.abs(call.pos - target);
 	const closest = target ? calls.toSorted((a, b) => near(a) - near(b))[0] : null;
-	if (calls.length) select(closest && near(closest) <= 50 ? closest : calls.find((c) => c.filter === "PASS") || calls[0]);
+	const any = calls.find((c) => c.filter === "PASS") || calls[0];
+	// An example: the call closest to it (an indel may be placed a few bp off)
+	if (run.example && !run.asked) {
+		if (calls.length) select(closest && near(closest) <= 50 ? closest : any);
+	} else if (target) {
+		// A position you asked about: the call there (an insertion is at the base before it), or else what
+		// DeepVariant counted there and why that made no candidate. Never some other call, unasked.
+		const there = calls.filter((c) => c.pos - 1 <= target && target <= c.pos + c.ref.length);
+		if (there.length) select(there.toSorted((a, b) => near(a) - near(b))[0]);
+		else showNoCandidate(target);
+	} else if (calls.length) select(any);
+}
+
+// Nothing was called where you asked: show the reads there, and (in the page) what DeepVariant counted
+async function showNoCandidate(pos) {
+	const chrom = run.position.chrom;
+	const near = (call) => Math.abs(call.pos - pos);
+	const realigned = run.model.realigns ? windowFor({ chrom, pos }) : null;
+	selected = null;
+	pileupsForSelected = [];
+	baseView = null;
+	readsInfo = null;
+	noCandidate = { chrom, pos, nearest: calls.toSorted((a, b) => near(a) - near(b)).slice(0, 3), realigned: Boolean(realigned) };
+	await tick();
+	const halfWidth = Math.max(15, Math.floor((divIgv?.clientWidth || 900) / 24));
+	await showInIgv(`${chrom}:${pos - halfWidth}-${pos + halfWidth}`, realigned);
+}
+
+// The alleles DeepVariant counted at and around the position with no candidate, each against the thresholds a
+// candidate has to pass (make_examples' --vsc_min_count_* and --vsc_min_fraction_*, as this model sets them)
+const counted = $derived.by(() => {
+	if (!noCandidate || !alleleCounts) return null;
+	const t = alleleCounts.thresholds;
+	const { chrom, pos } = noCandidate;
+	const alleles = [];
+	for (const row of alleleCounts.rows) {
+		const total = row.refCount + row.alleles.reduce((n, a) => n + a.count, 0);
+		for (const a of row.alleles) {
+			if (!["SUBSTITUTION", "INSERTION", "DELETION"].includes(a.type)) continue;
+			const indel = a.type !== "SUBSTITUTION";
+			// At the position (or, for an indel, the base before it, where VCF puts it); nearby, only what 2+ reads show
+			const here = row.pos === pos || (indel && row.pos === pos - 1);
+			if (!here && a.count < 2) continue;
+			const minCount = indel ? t.minCountIndels : t.minCountSnps,
+				minFraction = Math.round((indel ? t.minFractionIndels : t.minFractionSnps) * 1000) / 1000;
+			const fraction = total ? a.count / total : 0;
+			const record = a.type === "DELETION" ? { ref: a.bases, alt: a.bases[0] } : { ref: row.ref, alt: a.bases };
+			const call = calls.find((c) => c.pos === row.pos);
+			alleles.push({
+				chrom,
+				pos: row.pos,
+				...record,
+				here,
+				count: a.count,
+				total,
+				fraction,
+				minFraction,
+				call,
+				why:
+					a.count < minCount
+						? `${a.count} read: a candidate needs ${minCount}`
+						: fraction < minFraction
+							? `under the ${+(minFraction * 100).toFixed(1)}% a candidate needs`
+							: call
+								? "a candidate: it's one of this run's calls"
+								: "enough reads, yet no candidate"
+			});
+		}
+	}
+	alleles.sort((a, b) => Number(b.here) - Number(a.here) || b.count - a.count);
+	const at = alleleCounts.rows.find((r) => r.pos === pos);
+	return {
+		alleles: alleles.slice(0, 8),
+		at: at && { ref: at.ref, refCount: at.refCount, total: at.refCount + at.alleles.reduce((n, a) => n + a.count, 0) },
+		thresholds: {
+			minCountSnps: t.minCountSnps,
+			minCountIndels: t.minCountIndels,
+			snps: +(t.minFractionSnps * 100).toFixed(1),
+			indels: +(t.minFractionIndels * 100).toFixed(1)
+		}
+	};
+});
+// Your VCF's record at the position with no candidate, if it has one: it can be forced too
+const yoursAtPosition = $derived(
+	noCandidate && yourRecords
+		? (yourRecords.find(
+				(r) => r.chrom === noCandidate.chrom && r.pos - 1 <= noCandidate.pos && noCandidate.pos <= r.pos + r.ref.length
+			) ?? null)
+		: null
+);
+
+// Make DeepVariant consider a candidate it didn't (too few reads show it), to see the pileup image and what the
+// CNN makes of it. DeepVariant's own route for genotyping given alleles: --variant_caller=vcf_candidate_importer.
+function forceCandidate({ chrom, pos, ref, alt }) {
+	const forced = alt.split(",").map((a) => ({ chrom, pos, ref, alt: a }));
+	if (source === "upload") regionText = `${chrom}:${pos.toLocaleString("en-US")}`;
+	runDeepVariant({ force: forced });
+}
+// A small-model call, by the CNN instead: the same region with the small model off
+function askCnn(call) {
+	if (source === "upload") regionText = `${call.chrom}:${call.pos.toLocaleString("en-US")}`;
+	runDeepVariant({ cnnOnly: true, before: { pos: call.pos, GT: call.GT, GQ: call.GQ, filter: call.filter } });
 }
 
 // Each call's record in your VCF: same position and alleles (or, failing that, same position)
@@ -506,6 +690,7 @@ async function showBases(call) {
 
 async function select(call) {
 	selected = call;
+	noCandidate = null;
 	pileupsForSelected = [];
 	pileupIndex = 0;
 	pileupError = "";
@@ -674,6 +859,9 @@ function inspectExample(key, i) {
 function clearResults() {
 	calls = [];
 	selected = null;
+	alleleCounts = null;
+	noCandidate = null;
+	ranMode = null;
 	finished = false;
 	yourRecords = null;
 	error = "";
@@ -694,12 +882,158 @@ async function tryVcf(v) {
 	vcfError = "";
 	vcfProgress = 0;
 	try {
-		await loadVcf(await fetchFile(v.path));
+		const file = await fetchFile(v.path);
+		setInputFiles("dvi-vcf", [file]); // so the file input shows it, not "No file chosen"
+		await loadVcf(file);
 	} catch (e) {
 		vcfError = e.message ?? String(e);
 	}
 }
 const vcfBusy = $derived(Boolean(vcfInput && !vcfScan && !vcfError));
+// Puts files in a file input, as if they'd been picked (without firing its change event)
+function setInputFiles(id, list) {
+	const input = document.getElementById(id);
+	if (!input) return;
+	const transfer = new DataTransfer();
+	for (const f of list) transfer.items.add(f);
+	input.files = transfer.files;
+}
+
+// ---------------------------------------------------------------------------------------------------------
+// A locus as one file (bundle.js): the reads at the locus, this run's calls, what DeepVariant made of the reads
+// and the pileup images, to attach to an issue or send to someone, who can open it here. No server involved.
+// ---------------------------------------------------------------------------------------------------------
+// The reads overlapping a region, cut from a local BAM with samtools (the records as they are, with its index)
+async function cutReads({ bam, index }, regionText) {
+	samtools ??= new Aioli(["samtools/1.21"], { printInterleaved: false });
+	const CLI = await samtools;
+	const ext = index.name.toLowerCase().endsWith(".csi") ? "csi" : "bai";
+	const [input] = await CLI.mount([
+		{ name: "bundle_in.bam", data: bam },
+		{ name: `bundle_in.bam.${ext}`, data: index }
+	]);
+	for (const cmd of [`samtools view -b -o locus.bam ${input} ${regionText}`, "samtools index locus.bam"]) {
+		const { stderr } = await CLI.exec(cmd);
+		if (stderr.trim()) logText += `${cmd}\n${stderr}`;
+	}
+	const read = async (path) => {
+		const stat = await CLI.ls(path);
+		if (!stat) throw new Error("samtools couldn't cut the reads at the locus; see the log.");
+		return CLI.read({ path, length: stat.size });
+	};
+	return { bam: await read("locus.bam"), index: await read("locus.bam.bai") };
+}
+async function downloadBundle() {
+	if (bundling || !run || !finished) return;
+	bundleError = "";
+	try {
+		const { position } = run;
+		const at = selected?.pos ?? noCandidate?.pos ?? position.start;
+		// The reads DeepVariant read (the run's partitions) and a little more, for context in IGV
+		const locus = `${position.chrom}:${Math.max(1, position.runStart - 1000)}-${position.runEnd + 1000}`;
+		const entries = [];
+		const manifest = {
+			app: "inspector-for-deepvariant",
+			deepvariant: DV_VERSION,
+			model: run.model.key,
+			modelType: run.model.modelType,
+			reference: run.referenceKey,
+			position: `${position.chrom}:${at}`,
+			ran: ranRegion,
+			readsCut: locus,
+			force: run.force ?? undefined,
+			yourVcfVersion: run.yourVcf ? (vcfScan?.version ?? undefined) : undefined
+		};
+		bundling = "Cutting the reads at the locus…";
+		for (const [what, from] of [
+			["reads", run.reads],
+			["pangenome", run.pangenome]
+		]) {
+			if (!from) continue;
+			if (typeof from.bam === "string") manifest[what] = { url: from.bam, index: from.index };
+			else {
+				const cut = await cutReads(from, locus);
+				entries.push({ name: `${what}.bam`, data: cut.bam }, { name: `${what}.bam.bai`, data: cut.index });
+				manifest[what] = { file: `${what}.bam` };
+			}
+		}
+		bundling = "Packing…";
+		entries.push({ name: "deepvariant.vcf", data: run.vcfFile });
+		if (run.yourVcf) {
+			entries.push({ name: "your_deepvariant.vcf", data: run.yourVcf });
+			manifest.yourVcf = "your_deepvariant.vcf";
+		}
+		for (const r of run.realigned) entries.push({ name: `seen_by_deepvariant/${r.file.name}`, data: r.file });
+		if (run.phased) entries.push({ name: "seen_by_deepvariant/phased_by_deepvariant.bam", data: run.phased });
+		for (const p of await run.pileups.catch(() => []))
+			entries.push({ name: `pileups/${p.name.replace(/[^\w.>|-]+/g, "_")}.png`, data: await (await fetch(p.url)).blob() });
+		const readme = [
+			`Inspector for DeepVariant: ${manifest.position}`,
+			"",
+			`DeepVariant ${DV_VERSION}, ${run.model.modelType} model, on ${ranRegion} (${REFERENCES[run.referenceKey].name}).`,
+			`Open this .zip at ${location.origin}${location.pathname} ("Inspect your own data", then pick it as the reads)`,
+			"to rerun DeepVariant on these reads and see the call.",
+			"",
+			manifest.reads?.file ? `reads.bam: the reads overlapping ${locus}, as aligned` : `reads: ${manifest.reads?.url}`,
+			"deepvariant.vcf: this run's calls",
+			...(run.yourVcf ? ["your_deepvariant.vcf: the same region of the VCF this was compared with"] : []),
+			"seen_by_deepvariant/: the reads after DeepVariant's local realignment, or with its own phasing",
+			"pileups/: the pileup images the CNN classified",
+			"manifest.json: the model, reference and position, for the page"
+		].join("\n");
+		entries.unshift({ name: "README.txt", data: readme }, { name: "manifest.json", data: JSON.stringify(manifest, null, "\t") });
+		const url = URL.createObjectURL(await makeZip(entries));
+		const a = Object.assign(document.createElement("a"), { href: url, download: `deepvariant_${position.chrom}_${at}.zip` });
+		a.click();
+		setTimeout(() => URL.revokeObjectURL(url), 60000);
+	} catch (e) {
+		bundleError = e.message ?? String(e);
+	}
+	bundling = "";
+}
+// A bundle picked as the reads: fills in the inputs from it and runs
+let openWhenReady = false;
+async function openBundle(file) {
+	error = "";
+	try {
+		const entries = await readZip(file);
+		const manifest = JSON.parse((await entries.get("manifest.json")?.text()) ?? "null");
+		if (manifest?.app !== "inspector-for-deepvariant")
+			throw new Error(`${file.name} isn't a locus saved from this page (no manifest.json).`);
+		const asFile = (name) => entries.get(name) && new File([entries.get(name)], name);
+		const pair = (what) => [asFile(`${what}.bam`), asFile(`${what}.bam.bai`)].filter(Boolean);
+		clearResults();
+		if (modelByKey(manifest.model)) modelKey = manifest.model;
+		if (REFERENCES[manifest.reference]) referenceKey = manifest.reference;
+		regionText = manifest.position ?? "";
+		if (manifest.reads?.url) {
+			readsFrom = "url";
+			readsUrl = manifest.reads.url;
+			indexUrl = manifest.reads.index ?? "";
+		} else {
+			readsFrom = "file";
+			files = pair("reads");
+		}
+		pangenomeFiles = pair("pangenome");
+		const yourVcf = manifest.yourVcf && asFile(manifest.yourVcf);
+		await tick();
+		if (readsFrom === "file") setInputFiles("dvi-reads", files);
+		if (yourVcf) {
+			setInputFiles("dvi-vcf", [yourVcf]);
+			await loadVcf(yourVcf);
+		}
+		await tick();
+		if (canRun) runDeepVariant(manifest.force ? { force: manifest.force } : {});
+		else openWhenReady = manifest.force ? { force: manifest.force } : {};
+	} catch (e) {
+		error = e.message ?? String(e);
+	}
+}
+function pickReads(list) {
+	const bundle = list.find((f) => /\.zip$/i.test(f.name));
+	if (bundle) openBundle(bundle);
+	else files = list;
+}
 
 // A whole-genome BAM by URL, with its model and a position worth a look
 function tryBigBam(b) {
@@ -746,7 +1080,13 @@ onMount(() => {
 		else if (m.type === "step") steps = { ...steps, [m.step]: m.state };
 		else if (m.type === "ready") {
 			ready = true;
-			if (source === "example") runDeepVariant(); // the home page shows an example, run as soon as it can be
+			if (source === "example")
+				runDeepVariant(); // the home page shows an example, run as soon as it can be
+			else if (openWhenReady) {
+				const options = openWhenReady;
+				openWhenReady = false;
+				tick().then(() => canRun && runDeepVariant(options));
+			}
 		} else if (m.type === "done") onDone(m);
 		else if (m.type === "pileups") {
 			const { pileupsPending, model: ranWith } = run;
@@ -782,7 +1122,8 @@ const STEP_NAMES = {
 	call_variants: "call_variants",
 	postprocess_variants: "postprocess_variants"
 };
-const modelName = (mid) => ({ small_model: "small model", deepvariant: "CNN" })[mid] ?? mid ?? "";
+// (a run without the small model writes no MID: every call is the CNN's)
+const modelName = (mid) => ({ small_model: "small model", deepvariant: "CNN" })[mid] ?? mid ?? "CNN";
 const fmt = (n) => n.toLocaleString("en-US");
 const pct = (a, b) => (b ? `${((100 * a) / b).toFixed(1)}%` : "–");
 
@@ -846,7 +1187,49 @@ const pileupAlleles = (name) => {
 	return `${short ? `${short[1]} → ` : ""}${alts.join(" and ")}${alts.length > 1 ? " together" : ""}`;
 };
 const fileName = (r) => (r.url ? r.url.split("/").pop().split("?")[0] : r.alignments?.name);
+const best = (probs) => probs.reduce((a, b) => (b.p > a.p ? b : a));
 </script>
+
+<!-- Sharing a locus: a link (the model and position; reads only if they're at a URL), or the locus as a file -->
+{#snippet share()}
+	<div class="share">
+		<button
+			class="secondary"
+			onclick={copyLink}
+			title={readsFrom === "url"
+				? "A link to this locus of the reads at that URL"
+				: "A link with the model and position. Your files aren't in it: to share the reads too, download the locus."}
+			>{linkCopied ? "Link copied" : "Copy link"}</button
+		>
+		<button
+			class="secondary"
+			onclick={downloadBundle}
+			disabled={Boolean(bundling)}
+			title="One .zip with the reads at this locus, the calls, the reads as DeepVariant saw them and the pileup images: to attach to an issue or send to someone, who can open it on this page. Made in your browser; nothing is uploaded."
+			>{bundling || "Download this locus"}</button
+		>
+	</div>
+{/snippet}
+
+<!-- A run that isn't a normal one: a forced candidate, or the small model turned off -->
+{#snippet mode()}
+	{#if ranMode}
+		<p class="mode">
+			{#if ranMode.force}
+				<b>Forced candidate.</b> DeepVariant wouldn't have looked at
+				<span class="mono">{ranMode.force.map((f) => alleles(f)).join(", ")}</span> on its own. This run gave it that candidate (<span
+					class="mono">--variant_caller=vcf_candidate_importer</span
+				>) and let the CNN genotype it.
+			{:else}
+				<b>Small model off.</b> This run sent every candidate to the CNN (<span class="mono"
+					>--call_small_model_examples=false</span
+				>){#if ranMode.before && selected?.pos === ranMode.before.pos}: the small model had called this {ranMode.before.GT} ({ranMode
+						.before.filter}, GQ {ranMode.before.GQ}), the CNN calls it {selected.GT} ({selected.filter}, GQ {selected.GQ}){/if}.
+			{/if}
+			<button class="link inline" disabled={Boolean(busy)} onclick={() => runDeepVariant()}>Back to the normal run →</button>
+		</p>
+	{/if}
+{/snippet}
 
 <div class="dvi">
 	<!-- Your own data: the inputs, in full until a run, then as one line -->
@@ -885,9 +1268,9 @@ const fileName = (r) => (r.url ? r.url.split("/").pop().split("?")[0] : r.alignm
 								id="dvi-reads"
 								type="file"
 								multiple
-								accept=".bam,.sam,.bai,.csi"
+								accept=".bam,.sam,.bai,.csi,.cram,.crai,.zip"
 								aria-label="Reads (.bam and .bai)"
-								onchange={(e) => (files = [...e.target.files])}
+								onchange={(e) => pickReads([...e.target.files])}
 							/>
 							<div class="hint" class:bad={files.length && reads.error}>
 								{#if files.length && reads.error}{reads.error}
@@ -895,7 +1278,7 @@ const fileName = (r) => (r.url ? r.url.split("/").pop().split("?")[0] : r.alignm
 									{reads.alignments.name} + {reads.index.name}: only the locus is read from disk
 								{:else if files.length}{reads.alignments.name}: will be sorted and indexed in your browser (samtools)
 								{:else}The BAM you gave DeepVariant and its .bai, any size. Or a snippet made with <code>samtools view -b</code>;
-									small files don't need an index.{/if}
+									small files don't need an index. Or a locus saved from this page (.zip).{/if}
 							</div>
 						{:else}
 							<input type="text" class="url" placeholder="https://…/sample.bam" aria-label="BAM URL" bind:value={readsUrl} />
@@ -994,8 +1377,9 @@ const fileName = (r) => (r.url ? r.url.split("/").pop().split("?")[0] : r.alignm
 								{/each}
 							</select>
 							<div class="hint">
-								{#if referenceDetected && readsSpan?.contigs}<span class="ok">✓</span> Detected from your BAM's header.{:else}Contig
-									names must match your BAM (chr1, not 1).{/if}
+								{#if referenceDetected && readsSpan?.contigs}<span class="ok">✓</span> Detected from your BAM's header{bareContigs
+										? ": its contigs are named 1, 2, …, and the reference is read under those names"
+										: ""}.{:else}Human GRCh38 or GRCh37, with contigs named chr1 or 1. Other references aren't supported yet.{/if}
 							</div>
 						</div>
 						<div>
@@ -1036,7 +1420,11 @@ const fileName = (r) => (r.url ? r.url.split("/").pop().split("?")[0] : r.alignm
 							{:else if vcfScan}<span class="ok">✓</span>
 								{vcfInput.name}: {fmt(vcfScan.stats.records)} calls{vcfScan.gvcf
 									? " (gVCF: variant records only)"
-									: ""}{vcfScan.sample ? ` · ${vcfScan.sample}` : ""}
+									: ""}{vcfScan.sample ? ` · ${vcfScan.sample}` : ""}{vcfScan.version ? ` · DeepVariant ${vcfScan.version}` : ""}
+								{#if otherVersion}<br /><span class="warn"
+										>Made with DeepVariant {otherVersion}; this page reruns {DV_VERSION}, so some calls will differ for that
+										reason alone.</span
+									>{/if}
 							{:else}A .vcf or .vcf.gz from DeepVariant.{/if}
 						</div>
 						<div class="try-urls">
@@ -1104,10 +1492,13 @@ const fileName = (r) => (r.url ? r.url.split("/").pop().split("?")[0] : r.alignm
 					<span class="bad">Failed: {error.replace(/^Error: /, "")}</span>
 				{:else}
 					<span class="ok">✓ DeepVariant 1.10 ran</span>
+					{#if ranMode?.force}<span class="warn">forced candidate</span>{:else if ranMode?.cnnOnly}<span class="warn"
+							>small model off</span
+						>{/if}
 				{/if}
 				<span><span class="muted">Model</span> {(ranModel ?? model).name}</span>
 				<span><span class="muted">Reads</span> <span class="mono">{fileName(reads)}</span></span>
-				<span><span class="muted">Ref</span> {reference.name}</span>
+				<span><span class="muted">Ref</span> {reference.name}{bareContigs ? " (contigs 1, 2, …)" : ""}</span>
 				<span><span class="muted">Region</span> <span class="mono">{ranRegion || region.text || "–"}</span></span>
 				{#if vcfScan}<span><span class="muted">VCF</span> <span class="mono">{vcfInput.name}</span></span>{/if}
 				<button class="link push" onclick={() => (editing = true)}>Change inputs</button>
@@ -1210,6 +1601,8 @@ const fileName = (r) => (r.url ? r.url.split("/").pop().split("?")[0] : r.alignm
 				</div>
 				{#if !vcfScan.isDeepVariant}<p class="bad">
 						This VCF has no ##DeepVariant_version line: it may not come from DeepVariant.
+					</p>{:else if otherVersion}<p class="warn">
+						Made with DeepVariant {otherVersion}. This page reruns {DV_VERSION}: expect some calls to differ.
 					</p>{/if}
 				<div class="chips" role="tablist">
 					{#each Object.entries(LISTS) as [key, l] (key)}
@@ -1233,8 +1626,22 @@ const fileName = (r) => (r.url ? r.url.split("/").pop().split("?")[0] : r.alignm
 					aria-label="Filter by position"
 					bind:value={listFilter}
 				/>
+				<div class="list-controls">
+					<select aria-label="Variant type" bind:value={listType}>
+						<option value="all">SNPs and indels</option>
+						<option value="snp">SNPs only</option>
+						<option value="indel">Indels only</option>
+					</select>
+					<select aria-label="Order" bind:value={listSort}>
+						<option value="pos">By position</option>
+						<option value="gq">Lowest GQ first</option>
+					</select>
+				</div>
+				{#if listShown.total > listShown.rows.length}
+					<p class="hint">Showing {fmt(listShown.rows.length)} of {fmt(listShown.total)}.</p>
+				{/if}
 				<div class="list">
-					{#each listShown as r (`${r.chrom}:${r.pos}:${r.alt}`)}
+					{#each listShown.rows as r (`${r.chrom}:${r.pos}:${r.alt}`)}
 						<button
 							class="call-row"
 							class:active={selected && selected.pos === r.pos && selected.chrom === r.chrom}
@@ -1324,10 +1731,10 @@ const fileName = (r) => (r.url ? r.url.split("/").pop().split("?")[0] : r.alignm
 								<span class="muted" title="{selected.ref} → {selected.alt}">{alleles(selected)}</span>
 							</h2>
 						</div>
-						{#if source === "upload"}<button class="secondary" onclick={copyLink}
-								>{linkCopied ? "Link copied" : "Copy link"}</button
-							>{/if}
+						{#if source === "upload"}{@render share()}{/if}
 					</div>
+					{#if bundleError}<p class="bad">Couldn't save the locus: {bundleError}</p>{/if}
+					{@render mode()}
 
 					<!-- The alleles, base by base -->
 					{#if baseView?.error}
@@ -1382,12 +1789,25 @@ const fileName = (r) => (r.url ? r.url.split("/").pop().split("?")[0] : r.alignm
 							<dt>GQ</dt>
 							<dd>
 								<b>{selected.GQ}</b>
-								<span class="hint">{(10 ** (-Number(selected.GQ) / 10) * 100).toPrecision(2)}% chance it's wrong</span>
+								{#if selected.GT.includes(".")}
+									<span class="hint">of the most likely genotype{probs.length ? `, ${best(probs).gt}` : ""}</span>
+								{:else}
+									<span class="hint">{(10 ** (-Number(selected.GQ) / 10) * 100).toPrecision(2)}% chance it's wrong</span>
+								{/if}
 							</dd>
 							<dt>Filter</dt>
 							<dd><b>{selected.filter}</b> <span class="hint">QUAL {selected.qual}</span></dd>
 							<dt>Depth</dt>
-							<dd><b>{selected.DP}</b> <span class="hint">reads per allele: {selected.AD?.split(",").join(" · ")}</span></dd>
+							<dd>
+								<b>{selected.DP}</b>
+								<span class="hint"
+									>reads per allele: {selected.AD?.split(",").join(" · ")}{selected.VAF
+										? ` · alt fraction ${selected.VAF.split(",")
+												.map((v) => `${+(Number(v) * 100).toFixed(0)}%`)
+												.join(", ")}`
+										: ""}</span
+								>
+							</dd>
 							<dt>Called by</dt>
 							<dd><b>{modelName(selected.MID)}</b></dd>
 						</dl>
@@ -1405,8 +1825,26 @@ const fileName = (r) => (r.url ? r.url.split("/").pop().split("?")[0] : r.alignm
 							{#if probs.length > 3 && probs.some((x) => x.p < 0.001)}
 								<p class="hint">{probs.filter((x) => x.p < 0.001).length} other genotypes: under 0.1% each.</p>
 							{/if}
-							{#if selected.filter === "NoCall"}<p class="hint">NoCall (./.): no genotype was likely enough to call.</p>{/if}
-							{#if selected.filter === "RefCall"}<p class="hint">RefCall: DeepVariant thinks this candidate is reference.</p>{/if}
+							{#if selected.filter === "NoCall"}
+								{#if probs.length && best(probs).gt === "0/0"}
+									<p class="hint">
+										Why ./.: the most likely genotype is <b>0/0</b> ({(best(probs).p * 100).toFixed(0)}%), reference, but with GQ {selected.GQ}.
+										DeepVariant writes the CNN's reference calls with GQ under {HOMREF_MIN_GQ} as ./. instead of 0/0 (<span
+											class="mono">--cnn_homref_call_min_gq</span
+										>): "probably not a variant, but not sure".
+									</p>
+								{:else}
+									<p class="hint">NoCall (./.): no genotype was likely enough to call.</p>
+								{/if}
+							{/if}
+							{#if selected.filter === "RefCall"}<p class="hint">
+									{#if ranMode?.force}RefCall: made to look at this allele, the CNN classified it as reference, with GQ {selected.GQ}.
+									{:else}RefCall: enough reads show this allele to make it a candidate ({selected.AD?.split(",")
+											.slice(1)
+											.join(", ")} of
+										{selected.DP}), and DeepVariant classified it as reference with GQ {selected.GQ}, at least the {HOMREF_MIN_GQ}
+										it takes to write 0/0.{/if}
+								</p>{/if}
 						</div>
 						<div class="call-how">
 							<h3>How it was called</h3>
@@ -1414,6 +1852,9 @@ const fileName = (r) => (r.url ? r.url.split("/").pop().split("?")[0] : r.alignm
 								<li>
 									{#if selected.MID === "small_model"}
 										By the <b>small model</b>, from summary features (allele counts, base and mapping qualities): no pileup image.
+										<button class="link inline" disabled={Boolean(busy)} onclick={() => askCnn(selected)}
+											>Ask the CNN instead →</button
+										>
 									{:else}
 										By the <b>CNN</b>, from the pileup images below.
 									{/if}
@@ -1441,13 +1882,101 @@ const fileName = (r) => (r.url ? r.url.split("/").pop().split("?")[0] : r.alignm
 									<li class:ok={yours && agrees(selected)} class:differs={yours && !agrees(selected)}>
 										{#if !yours}Your VCF has no record here.
 										{:else if agrees(selected)}Your VCF agrees: {yours.GT}, {yours.filter}, GQ {yours.GQ}.
-										{:else}Your VCF says {yours.GT}, {yours.filter}, GQ {yours.GQ}: another version, model or flags, or (where
-											more reads cover a site than fit in a pileup image) other sampled reads.{/if}
+										{:else if ranMode}Your VCF says {yours.GT}, {yours.filter}, GQ {yours.GQ}: this run isn't a normal one (see
+											above), so they needn't agree.
+										{:else if otherVersion}Your VCF says {yours.GT}, {yours.filter}, GQ {yours.GQ}. It was made with DeepVariant {otherVersion};
+											this is {DV_VERSION}, which alone can explain the difference.
+										{:else}Your VCF says {yours.GT}, {yours.filter}, GQ {yours.GQ}: another model or flags, or (where more reads
+											cover a site than fit in a pileup image) other sampled reads.{/if}
 									</li>
 								{/if}
 							</ul>
 						</div>
 					</div>
+				</div>
+			{:else if noCandidate}
+				{@const nc = noCandidate}
+				<div class="card call-card">
+					<div class="call-top">
+						<div>
+							<span class="hint">{ranModel.name} · {ranRegion}</span>
+							<h2 class="call-title mono">{nc.chrom}:{fmt(nc.pos)} <span class="muted">no candidate here</span></h2>
+						</div>
+						{#if source === "upload"}{@render share()}{/if}
+					</div>
+					{#if bundleError}<p class="bad">Couldn't save the locus: {bundleError}</p>{/if}
+					{@render mode()}
+					<p class="nc-lead">
+						DeepVariant made no call at this position because it never became a <b>candidate</b>: its models only see sites where
+						enough reads show the same non-reference allele. Below is what it counted here, in the reads
+						{nc.realigned ? "after its local realignment" : "as it used them"} (bases and reads under its quality thresholds aren't
+						counted).
+					</p>
+					{#if counted?.alleles.length}
+						<div class="nc-table">
+							{#each counted.alleles as a (`${a.pos}:${a.ref}:${a.alt}`)}
+								{@const passes = a.fraction >= a.minFraction}
+								<div class="nc-row" class:near={!a.here}>
+									<span class="mono nc-pos">{fmt(a.pos)}</span>
+									<span class="mono nc-allele" title="{a.ref} → {a.alt}">{alleles(a)}</span>
+									<span class="nc-bar" title="{a.count} of {a.total} reads">
+										<span class="nc-fill" class:passes style="width: {Math.min(100, a.fraction * 100)}%"></span>
+										<span class="nc-tick" style="left: {a.minFraction * 100}%"></span>
+									</span>
+									<span class="mono nc-count">{a.count} of {a.total} · {(a.fraction * 100).toFixed(1)}%</span>
+									<span class="hint nc-why">{a.why}</span>
+									{#if a.call}
+										<button class="link" onclick={() => select(a.call)}>Inspect it →</button>
+									{:else}
+										<button class="link" disabled={Boolean(busy)} onclick={() => forceCandidate(a)}>Force this candidate →</button
+										>
+									{/if}
+								</div>
+							{/each}
+						</div>
+						<p class="hint">
+							The tick is the fraction of reads a candidate needs with this model: {counted.thresholds.snps}% for SNPs, {counted
+								.thresholds.indels}% for indels, and at least {counted.thresholds.minCountSnps} reads (<span class="mono"
+								>--vsc_min_fraction_snps</span
+							>, <span class="mono">--vsc_min_fraction_indels</span>,
+							<span class="mono">--vsc_min_count_snps</span>). Forcing a candidate makes DeepVariant draw its pileup image and
+							genotype it anyway.
+						</p>
+					{:else if counted?.at}
+						<p>
+							<b>All {counted.at.refCount} reads</b> it counted at {fmt(nc.pos)} show the reference base
+							<span class="mono">{counted.at.ref}</span>, and no other allele is seen in 2 or more reads within 10 bp.
+						</p>
+					{:else}
+						<p>
+							DeepVariant counted <b>no reads</b> at this position: none cover it, or none pass its filters (mapping quality, duplicates).
+						</p>
+					{/if}
+					{#if yourRecords}
+						<p class="nc-yours">
+							{#if yoursAtPosition}
+								Your VCF has <span class="mono">{alleles(yoursAtPosition)}</span> here ({yoursAtPosition.GT}, {yoursAtPosition.filter},
+								GQ {yoursAtPosition.GQ}){otherVersion ? `, made with DeepVariant ${otherVersion}` : ""}.
+								<button class="link" disabled={Boolean(busy)} onclick={() => forceCandidate(yoursAtPosition)}
+									>Force that candidate →</button
+								>
+							{:else}
+								Your VCF has no record here either.
+							{/if}
+						</p>
+					{/if}
+					{#if nc.nearest.length}
+						<p class="hint">
+							Nearest calls in this run:
+							{#each nc.nearest as c (`${c.pos}:${c.alt}`)}
+								<button class="link nc-near" onclick={() => select(c)}
+									><span class="mono">{fmt(c.pos)}</span> {c.GT} ({Math.abs(c.pos - nc.pos)} bp away)</button
+								>
+							{/each}
+						</p>
+					{:else}
+						<p class="hint">No candidates anywhere in {ranRegion}.</p>
+					{/if}
 				</div>
 			{:else if finished && !calls.length}
 				<div class="card"><p class="hint">No candidate variants in {ranRegion}.</p></div>
@@ -1455,7 +1984,7 @@ const fileName = (r) => (r.url ? r.url.split("/").pop().split("?")[0] : r.alignm
 				<div class="card"><p class="hint">Pick a call on the left, or run DeepVariant above.</p></div>
 			{/if}
 
-			{#if calls.length}
+			{#if selected}
 				<!-- The pileup images the CNN classified, one panel per channel -->
 				<div class="card view-card">
 					<div class="view-head">
@@ -1504,7 +2033,9 @@ const fileName = (r) => (r.url ? r.url.split("/").pop().split("?")[0] : r.alignm
 						<a class="hint" href={shown.url} download="{shown.name}.png">Download DeepVariant's PNG</a>
 					{/if}
 				</div>
+			{/if}
 
+			{#if selected || noCandidate}
 				<!-- The reads, as aligned and as DeepVariant saw them -->
 				<div class="card view-card">
 					<div class="view-head">
@@ -1537,7 +2068,11 @@ const fileName = (r) => (r.url ? r.url.split("/").pop().split("?")[0] : r.alignm
 
 					{#if calls.length}
 						<div class="panel" hidden={tab !== "calls"}>
-							<p class="hint">Every call in {ranRegion} ({ranModel.modelType} model). Click one to inspect it.</p>
+							<p class="hint">
+								{#if ranMode?.force}Only the forced candidate: with candidates given, DeepVariant looks for no others.
+								{:else}Every call in {ranRegion} ({ranModel.modelType} model{ranMode?.cnnOnly ? ", small model off" : ""}). Click
+									one to inspect it.{/if}
+							</p>
 							<div class="tablewrap">
 								<table>
 									<thead>
@@ -1656,6 +2191,107 @@ button.link {
 	font-weight: 500;
 	cursor: pointer;
 	text-align: left;
+}
+.warn {
+	color: var(--warning);
+}
+.share {
+	display: flex;
+	gap: 8px;
+}
+.mode {
+	margin: 0 0 12px;
+	padding: 8px 12px;
+	border: 1px solid var(--line);
+	border-left: 3px solid var(--warning);
+	background: var(--bg-subtle);
+	font-size: 13px;
+}
+button.link.inline {
+	padding: 0;
+	margin-left: 4px;
+}
+button.link:disabled {
+	opacity: 0.5;
+	cursor: default;
+}
+.list-controls {
+	display: flex;
+	gap: 6px;
+	margin: 6px 0;
+}
+.list-controls select {
+	flex: 1;
+	min-width: 0;
+	font: inherit;
+	font-size: 12px;
+	padding: 4px 6px;
+	border: 1px solid var(--line);
+	border-radius: 6px;
+	background: var(--bg);
+	color: inherit;
+}
+.nc-lead {
+	max-width: 760px;
+	margin-bottom: 12px;
+}
+.nc-table {
+	display: grid;
+	grid-template-columns: auto minmax(60px, auto) minmax(80px, 180px) auto 1fr auto;
+	gap: 6px 14px;
+	align-items: center;
+	margin-bottom: 8px;
+	font-size: 13px;
+}
+.nc-row {
+	display: contents;
+}
+.nc-row.near > * {
+	opacity: 0.75;
+}
+.nc-allele {
+	overflow: hidden;
+	text-overflow: ellipsis;
+	white-space: nowrap;
+	max-width: 220px;
+}
+.nc-bar {
+	position: relative;
+	height: 10px;
+	border-radius: 3px;
+	background: var(--line);
+}
+.nc-fill {
+	position: absolute;
+	inset: 0 auto 0 0;
+	border-radius: 3px;
+	background: var(--warning);
+}
+.nc-fill.passes {
+	background: var(--done);
+}
+.nc-tick {
+	position: absolute;
+	top: -4px;
+	bottom: -4px;
+	border-left: 2px solid var(--fg);
+}
+.nc-count {
+	white-space: nowrap;
+}
+.nc-yours {
+	margin: 10px 0 6px;
+}
+.nc-near {
+	margin-right: 12px;
+}
+@media (max-width: 800px) {
+	.nc-table {
+		grid-template-columns: auto 1fr auto;
+	}
+	.nc-why {
+		grid-column: 1 / 3;
+	}
 }
 button.secondary {
 	padding: 8px 12px;

@@ -93,7 +93,7 @@ const isGvcfBlock = (alt) => alt === "<*>";
 const alleles = (gt) => (gt ?? "").split(/[/|]/);
 
 // Summarizes a DeepVariant VCF (or gVCF: only its variant records). Returns
-// {sample, header, compressed, blocks, chroms, records, stats, lists, gvcf}, where blocks is the index used by
+// {sample, header, compressed, blocks, chroms, records, stats, lists, gvcf, isDeepVariant, version}, where blocks is the index used by
 // recordsIn and lists hold up to LIST_MAX calls each: lowGq (PASS with GQ < 20), noCall (./.), hetAlt (1/2).
 export async function scanVcf(file, onProgress) {
 	// By content, not name: gzip files start with 1f 8b
@@ -179,7 +179,13 @@ export async function scanVcf(file, onProgress) {
 		stats,
 		lists,
 		gvcf,
-		isDeepVariant: header.some((l) => l.startsWith("##DeepVariant_version"))
+		isDeepVariant: header.some((l) => l.startsWith("##DeepVariant_version")),
+		// e.g. "1.6.1", from ##DeepVariant_version=1.6.1
+		version:
+			header
+				.find((l) => l.startsWith("##DeepVariant_version="))
+				?.split("=")[1]
+				.trim() ?? null
 	};
 }
 
